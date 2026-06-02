@@ -1,0 +1,3102 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#05080F">
+<title>XAUUSD Journal</title>
+
+<!-- Preconnect to speed up external resources -->
+<link rel="preconnect" href="https://www.gstatic.com" crossorigin>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+<!-- Firebase -->
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore-compat.js"></script>
+<script>
+  firebase.initializeApp({
+    apiKey: "AIzaSyAUDjp551GhHpMkLoOPvopUDqDJatoOgGQ",
+    authDomain: "naitao-xauusd.firebaseapp.com",
+    projectId: "naitao-xauusd",
+    storageBucket: "naitao-xauusd.firebasestorage.app",
+    messagingSenderId: "422991534704",
+    appId: "1:422991534704:web:6b66742dffb670a3a8b2b5"
+  });
+  const db = firebase.firestore();
+  const auth = firebase.auth();
+  // จำ session ไว้ในเครื่อง — ไม่ต้อง login ใหม่ยกเว้น logout เอง
+  auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+
+  // ── OFFLINE PERSISTENCE ──
+  db.enablePersistence({ synchronizeTabs: true }).catch(() => {});
+
+  // ── LOCAL CACHE ──
+  const CACHE_KEY = 'xau_trades_cache';
+  const NOTES_KEY = 'xau_notes_cache';
+  try {
+    const cached = localStorage.getItem(CACHE_KEY);
+    if (cached) { window.trades = JSON.parse(cached); window._cacheLoaded = true; }
+    const cachedNotes = localStorage.getItem(NOTES_KEY);
+    if (cachedNotes) window.monthNotes = JSON.parse(cachedNotes);
+  } catch(e) {}
+
+  // ── USER REF HELPERS (uid-scoped) ──
+  window._userRef = null;
+  function userCol(col) { return window._userRef.collection(col); }
+
+  window.dbSaveTrade = (t) => userCol('trades').doc(String(t.id)).set(t);
+  window.dbDeleteTrade = (id) => userCol('trades').doc(String(id)).delete();
+  window.dbSaveNote = (key, text) => userCol('monthNotes').doc(key).set({ text });
+
+  let _tradesUnsub = null, _notesUnsub = null;
+
+  function startListeners() {
+    if (_tradesUnsub) _tradesUnsub();
+    if (_notesUnsub) _notesUnsub();
+    _tradesUnsub = userCol('trades').onSnapshot((snap) => {
+      const loaded = [];
+      snap.forEach(d => loaded.push(d.data()));
+      loaded.sort((a,b) => b.date !== a.date ? b.date.localeCompare(a.date) : b.id - a.id);
+      window.trades = loaded;
+      try { localStorage.setItem(CACHE_KEY, JSON.stringify(loaded)); } catch(e) {}
+      if (!window._fbReady) {
+        window._fbReady = true;
+        document.querySelector('.app').style.opacity = '1';
+        if (window._appInit) window._appInit();
+        // โหลด portfolio + settings ของ user นี้
+        if (window._loadPortFromFirebase) window._loadPortFromFirebase();
+        if (window._loadSettingsFromFirebase) window._loadSettingsFromFirebase();
+      } else {
+        const sc = document.querySelector('.nb.active')?.dataset?.screen;
+        if (sc==='dash') window.renderDash && window.renderDash();
+        if (sc==='log') window.renderLog && window.renderLog();
+        if (sc==='monthly') window.renderMonthly && window.renderMonthly();
+      }
+    }, err => console.error('Firebase error:', err.message));
+    _notesUnsub = userCol('monthNotes').onSnapshot(snap => {
+      const n={}; snap.forEach(d=>{n[d.id]=d.data().text||''}); window.monthNotes=n;
+      try { localStorage.setItem(NOTES_KEY, JSON.stringify(n)); } catch(e) {}
+      if (document.querySelector('.nav-btn.active')?.dataset?.screen==='monthly') {
+        const el=document.getElementById('m-note');
+        if(el&&window._vy!==undefined) el.value=n[`${window._vy}-${window._vm}`]||'';
+      }
+    });
+  }
+
+  // ── MIGRATE ROOT DATA → users/{uid}/ (ทำครั้งเดียวตอน login Gmail แรก) ──
+  async function migrateRootData(uid) {
+    const migKey = 'xau_migrated_' + uid;
+    if (localStorage.getItem(migKey)) return; // migrate แล้ว ข้าม
+    try {
+      const userRef = db.collection('users').doc(uid);
+      // Migrate trades
+      const tradesSnap = await db.collection('trades').get();
+      if (!tradesSnap.empty) {
+        const batch = db.batch();
+        tradesSnap.forEach(d => batch.set(userRef.collection('trades').doc(d.id), d.data()));
+        await batch.commit();
+        console.log('✅ Migrated', tradesSnap.size, 'trades');
+      }
+      // Migrate monthNotes
+      const notesSnap = await db.collection('monthNotes').get();
+      if (!notesSnap.empty) {
+        const batch2 = db.batch();
+        notesSnap.forEach(d => batch2.set(userRef.collection('monthNotes').doc(d.id), d.data()));
+        await batch2.commit();
+      }
+      // Migrate settings
+      const settDoc = await db.collection('settings').doc('main').get();
+      if (settDoc.exists) await userRef.collection('settings').doc('main').set(settDoc.data());
+      // Migrate portfolio
+      const portDoc = await db.collection('portfolio').doc('main').get();
+      if (portDoc.exists) await userRef.collection('portfolio').doc('main').set(portDoc.data());
+      localStorage.setItem(migKey, '1');
+      console.log('✅ Migration complete');
+    } catch(e) { console.warn('Migration error:', e); }
+  }
+
+  // ── AUTH STATE LISTENER ──
+  auth.onAuthStateChanged(async (user) => {
+    console.log('Auth state changed:', user ? user.email : 'null');
+    if (user) {
+      window._userRef = db.collection('users').doc(user.uid);
+      // reset _fbReady ทุกครั้งที่ login ใหม่
+      window._fbReady = false;
+      // Migrate ข้อมูลเดิม (root) ไปใส่ account Gmail แรก (ทำครั้งเดียว)
+      await migrateRootData(user.uid);
+      // update profile card
+      document.getElementById('sett-profile-name').textContent = user.displayName || user.email;
+      document.getElementById('sett-profile-email').textContent = user.email;
+      const initials = (user.displayName||user.email).split(/[ @]/)[0].slice(0,2).toUpperCase();
+      document.getElementById('sett-avatar-initials').textContent = initials;
+      // hide login screen, show app
+      document.getElementById('google-login-screen').style.display = 'none';
+      document.querySelector('.app').style.display = '';
+      startListeners();
+    } else {
+      // ไม่ได้ login → แสดง login screen
+      if (_tradesUnsub) { _tradesUnsub(); _tradesUnsub = null; }
+      if (_notesUnsub) { _notesUnsub(); _notesUnsub = null; }
+      window._userRef = null;
+      document.getElementById('google-login-screen').style.display = 'flex';
+      document.querySelector('.app').style.display = 'none';
+    }
+  });
+
+  window.signInWithGoogle = function() {
+    const provider = new firebase.auth.GoogleAuthProvider();
+    auth.signInWithRedirect(provider);
+  };
+  // รับผลลัพธ์หลัง redirect กลับมา
+  auth.getRedirectResult().then(result => {
+    // onAuthStateChanged จะ handle เอง ไม่ต้องทำอะไรเพิ่ม
+  }).catch(err => {
+    if (err.code && err.code !== 'auth/no-auth-event') {
+      console.error('Login error:', err.message);
+      alert('Login ไม่สำเร็จ: ' + err.message);
+    }
+  });
+  window.signOut = function() {
+    if (!confirm('ออกจากระบบ?')) return;
+    localStorage.removeItem(CACHE_KEY);
+    localStorage.removeItem(NOTES_KEY);
+    auth.signOut();
+  };
+
+  if (window._cacheLoaded) {
+    requestAnimationFrame(() => {
+      if (!window._fbReady) {
+        document.querySelector('.app').style.opacity = '1';
+        if (window._appInit) window._appInit();
+        window._fbReady = true;
+      }
+    });
+  }
+</script>
+
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=DM+Mono:wght@400;500;600&display=swap" rel="stylesheet" media="print" onload="this.media='all'">
+<noscript><link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=DM+Mono:wght@400;500;600&display=swap" rel="stylesheet"></noscript>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+:root{
+  /* ── DARK THEME (default) ── */
+  --bg:#05080F;
+  --s1:#0B1020;
+  --s2:#111827;
+  --s3:#1C2A3A;
+  --s4:#243447;
+  --bdr:rgba(255,255,255,0.06);
+  --bdr2:rgba(255,255,255,0.1);
+  --gold:#00E5A0;
+  --gold2:rgba(0,229,160,.1);
+  --gold3:rgba(0,229,160,.15);
+  --em:#00E5A0;
+  --em2:rgba(0,229,160,.1);
+  --em3:rgba(0,229,160,.15);
+  --rose:#FF4D6D;
+  --rose2:rgba(255,77,109,.1);
+  --rose3:rgba(255,77,109,.15);
+  --amber:#FF9F1C;
+  --blue:#4DA6FF;
+  --t1:#F0F4FF;
+  --t2:#8BA0BC;
+  --t3:#4A5C70;
+  --t4:#2A3A4A;
+  --r1:8px;--r2:14px;--r3:20px;--r4:28px;
+  --topbar-bg:rgba(5,8,15,0.92);
+  --nav-bg:rgba(11,16,32,0.97);
+}
+html,body{height:100%;background:#05080F;color:var(--t1);font-family:'Inter',sans-serif;overflow:hidden;-webkit-font-smoothing:antialiased}
+.mono{font-family:'DM Mono',monospace}
+
+/* ── APP SHELL ── */
+.app{display:flex;flex-direction:column;height:100vh;max-width:480px;margin:0 auto;opacity:1;transition:opacity .4s}
+
+/* ── TOP BAR ── */
+.topbar{position:fixed;top:0;left:50%;transform:translateX(-50%);width:100%;max-width:480px;z-index:99;
+  background:var(--topbar-bg,rgba(255,255,255,.92));backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  padding:calc(10px + env(safe-area-inset-top,0px)) 16px 10px;border-bottom:0.5px solid var(--bdr)}
+.tb-inner{display:flex;justify-content:space-between;align-items:center}
+.tb-left{}
+.tb-title{font-size:17px;font-weight:700;color:var(--t1);letter-spacing:-.01em;display:flex;align-items:center;gap:7px}
+.tb-dot{width:7px;height:7px;border-radius:50%;background:var(--em);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.6;transform:scale(.85)}}
+.tb-sub{font-size:11px;color:var(--t3);margin-top:2px;font-weight:500}
+.tb-badge{font-family:'DM Mono',monospace;font-size:11px;font-weight:600;
+  background:rgba(24,95,165,.08);border:0.5px solid rgba(24,95,165,.2);color:var(--blue);
+  padding:5px 11px;border-radius:99px}
+
+/* ── SCREENS ── */
+.screens{flex:1;overflow:hidden;position:relative}
+.screen{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;
+  padding:calc(56px + env(safe-area-inset-top,0px)) 14px calc(72px + env(safe-area-inset-bottom,0px));
+  display:none;-webkit-overflow-scrolling:touch}
+.screen::-webkit-scrollbar{display:none}
+.screen.active{display:block}
+
+/* ── NAV ── */
+.nav{display:flex;align-items:center;background:var(--nav-bg,rgba(255,255,255,.95));backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border-top:0.5px solid var(--bdr);position:fixed;bottom:0;left:50%;transform:translateX(-50%);
+  width:100%;max-width:480px;z-index:100;padding:8px 4px calc(8px + env(safe-area-inset-bottom,0px))}
+.nb{flex:1;padding:6px 4px;display:flex;flex-direction:column;align-items:center;gap:0;
+  cursor:pointer;border:none;background:none;color:var(--t3);transition:color .2s;font-family:'Inter',sans-serif;border-radius:12px}
+.nb.active{color:var(--em)}
+.nb-icon{width:22px;height:22px;display:flex;align-items:center;justify-content:center}
+.nb-label{font-size:9px;font-weight:700;letter-spacing:.06em;text-transform:uppercase}
+.nb-center{flex:0 0 64px}
+.nb-plus{width:52px;height:52px;border-radius:50%;background:var(--em);display:flex;align-items:center;justify-content:center;color:#fff;box-shadow:0 4px 18px rgba(29,158,117,.35);margin-top:-18px}
+
+/* ── SECTION ── */
+.sec{font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--t3);margin:16px 0 8px;display:flex;align-items:center;gap:8px}
+.sec::after{content:'';flex:1;height:1px;background:var(--bdr)}
+
+/* ── CARDS ── */
+.card{background:var(--s2);border-radius:var(--r3);border:0.5px solid var(--bdr);padding:16px;margin-bottom:10px}
+.card-xs{background:var(--s2);border-radius:var(--r2);border:0.5px solid var(--bdr);padding:12px}
+
+/* ── WIN RATE HERO ── */
+.wr-hero{background:var(--s1);border-radius:var(--r4);border:0.5px solid var(--bdr);
+  padding:20px 18px 16px;margin-bottom:10px;position:relative;overflow:hidden}
+.wr-hero-bg{display:none}
+.wr-hero-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px}
+.wr-hero-label{font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--t3)}
+.wr-hero-streak{font-size:12px;font-weight:700;color:var(--blue);background:rgba(24,95,165,.08);padding:3px 10px;border-radius:20px;border:0.5px solid rgba(24,95,165,.15)}
+.wr-hero-main{display:flex;align-items:flex-end;gap:12px;margin-bottom:12px}
+.wr-hero-num{font-family:'DM Mono',monospace;font-size:48px;font-weight:500;line-height:1;letter-spacing:-.03em}
+.wr-hero-num.hi{color:var(--em)}
+.wr-hero-num.mid{color:var(--blue)}
+.wr-hero-num.lo{color:var(--rose)}
+.wr-hero-right{padding-bottom:8px}
+.wr-hero-pnl{font-family:'DM Mono',monospace;font-size:18px;font-weight:600;line-height:1}
+.wr-hero-pnl.pos{color:var(--em)}
+.wr-hero-pnl.neg{color:var(--rose)}
+.wr-hero-trades{font-size:11px;color:var(--t3);margin-top:4px}
+.wr-bar-wrap{height:5px;background:rgba(255,255,255,.05);border-radius:99px;overflow:hidden;margin-bottom:10px}
+.wr-bar-fill{height:100%;border-radius:99px;transition:width 1s cubic-bezier(.4,0,.2,1);background:var(--em)}
+.wr-stats{display:flex;gap:0;justify-content:space-between}
+.wr-stat{text-align:center;flex:1}
+.wr-stat-val{font-family:'DM Mono',monospace;font-size:14px;font-weight:600}
+.wr-stat-val.w{color:var(--em)}
+.wr-stat-val.l{color:var(--rose)}
+.wr-stat-val.b{color:var(--amber)}
+.wr-stat-val.n{color:var(--t2)}
+.wr-stat-label{font-size:9px;color:var(--t3);margin-top:3px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+
+/* ── KPI GRID ── */
+.kpi-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px}
+.kpi{background:var(--s2);border-radius:var(--r2);padding:14px;border:0.5px solid var(--bdr);position:relative;overflow:hidden;cursor:default}
+.kpi::before{content:'';position:absolute;inset:0 0 auto 0;height:2px;border-radius:var(--r2) var(--r2) 0 0;opacity:.8}
+.kpi.g::before{background:var(--em)}
+.kpi.e::before{background:var(--em)}
+.kpi.b::before{background:var(--blue)}
+.kpi.p::before{background:#A78BFA}
+.kpi-label{font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--t3);margin-bottom:7px}
+.kpi-val{font-family:'DM Mono',monospace;font-size:20px;font-weight:500;letter-spacing:-.02em;line-height:1}
+.kpi-val.pos{color:var(--em)}
+.kpi-val.neg{color:var(--rose)}
+.kpi-val.gold{color:var(--blue)}
+.kpi-val.w{color:var(--t1)}
+.kpi-sub{font-size:10px;color:var(--t3);margin-top:5px;font-weight:500}
+
+/* ── EQUITY CHART ── */
+.chart-wrap{height:80px;position:relative}
+canvas{width:100%!important;height:100%!important}
+
+/* ── BARS ── */
+.bar-row{display:flex;align-items:center;gap:10px;margin-bottom:9px}
+.bar-name{font-size:11px;color:var(--t2);width:86px;flex-shrink:0;font-weight:600}
+.bar-track{flex:1;height:5px;background:#EEF1F6;border-radius:99px;overflow:hidden}
+.bar-fill{height:100%;border-radius:99px;transition:width .7s cubic-bezier(.4,0,.2,1)}
+.bar-pct{font-family:'DM Mono',monospace;font-size:11px;font-weight:600;color:var(--t2);width:32px;text-align:right;flex-shrink:0}
+.bar-cnt{font-size:10px;color:var(--t3);width:28px;text-align:right;flex-shrink:0}
+
+/* ── LOSS WARNING ── */
+.loss-warn{background:rgba(255,77,109,.08);border:1px solid rgba(255,77,109,.2);border-radius:var(--r2);
+  padding:12px 14px;margin-bottom:10px;display:flex;align-items:center;gap:10px}
+.loss-warn-icon{font-size:20px;flex-shrink:0}
+.loss-warn-text{font-size:12px;color:var(--rose);font-weight:600;line-height:1.5}
+
+
+
+/* ── FORM ── */
+.fsec{display:flex;align-items:center;gap:10px;margin:18px 0 12px}
+.fsec-line{flex:1;height:1px;background:var(--bdr)}
+.fsec-label{font-size:9px;font-weight:600;letter-spacing:.06em;color:var(--em);text-transform:uppercase;
+  background:var(--em2);border:0.5px solid rgba(29,158,117,.2);padding:4px 10px;border-radius:99px;white-space:nowrap}
+
+.form-row{margin-bottom:11px}
+.form-label{display:block;font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--t3);margin-bottom:5px}
+.form-input{width:100%;background:var(--s2);border:0.5px solid var(--bdr2);border-radius:var(--r1);
+  padding:13px 14px;font-size:16px;color:var(--t1);font-family:'Inter',sans-serif;outline:none;
+  transition:border-color .15s;-webkit-appearance:none;appearance:none}
+.form-input:focus{border-color:var(--em)}
+.form-input::placeholder{color:var(--t3)}
+select.form-input{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%234A5C70' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center;padding-right:36px}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px}
+
+/* BUY/SELL */
+.bs-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+.bs-btn{padding:15px;border-radius:var(--r2);font-size:15px;font-weight:700;border:2px solid;
+  cursor:pointer;letter-spacing:.1em;text-align:center;transition:all .15s;font-family:'Inter',sans-serif}
+.bs-btn.buy{background:var(--em2);border-color:rgba(0,229,160,.25);color:var(--em)}
+.bs-btn.buy.active{background:var(--em);border-color:var(--em);color:#fff;box-shadow:0 4px 14px rgba(29,158,117,.3)}
+.bs-btn.sell{background:var(--rose2);border-color:rgba(255,77,109,.25);color:var(--rose)}
+.bs-btn.sell.active{background:var(--rose);border-color:var(--rose);color:#fff;box-shadow:0 4px 14px rgba(226,75,74,.3)}
+
+/* CHIPS */
+.chip-group{display:flex;flex-wrap:wrap;gap:6px}
+.sch{padding:8px 13px;border-radius:var(--r1);font-size:12px;font-weight:600;
+  background:var(--s2);border:1px solid var(--bdr);color:var(--t3);cursor:pointer;transition:all .15s}
+.sch:active{transform:scale(.97)}
+.sch.sel{background:var(--em2);border-color:rgba(29,158,117,.3);color:var(--em)}
+
+/* RESULT */
+.res-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+.res-btn{padding:13px;border-radius:var(--r1);font-size:14px;font-weight:700;border:2px solid;
+  cursor:pointer;text-align:center;transition:all .15s;font-family:'Inter',sans-serif;letter-spacing:.05em}
+.res-btn.win-btn{background:var(--em2);border-color:rgba(0,229,160,.2);color:var(--em)}
+.res-btn.win-btn.active{background:var(--em3);border-color:var(--em)}
+.res-btn.loss-btn{background:var(--rose2);border-color:rgba(255,77,109,.2);color:var(--rose)}
+.res-btn.loss-btn.active{background:var(--rose3);border-color:var(--rose)}
+.res-btn.be-btn{background:rgba(255,159,28,.08);border-color:rgba(255,159,28,.2);color:var(--amber)}
+.res-btn.be-btn.active{background:rgba(255,159,28,.18);border-color:var(--amber)}
+
+/* STARS */
+.star-row{display:flex;gap:8px}
+.star{font-size:26px;cursor:pointer;opacity:.18;transition:opacity .1s;color:#BA7517;background:none;border:none;padding:0;line-height:1}
+.star.lit{opacity:1}
+
+/* AUTO CALC */
+.auto-calc{background:var(--s3);border:0.5px solid var(--bdr);border-radius:var(--r2);
+  padding:11px 14px;margin-bottom:12px;display:flex;gap:0;justify-content:space-between}
+.ac-item{text-align:center;flex:1}
+.ac-label{font-size:9px;color:var(--t3);font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}
+.ac-val{font-family:'DM Mono',monospace;font-size:15px;font-weight:600;color:var(--blue)}
+
+/* IMG UPLOAD */
+.img-upload-btn{background:var(--s2);border:1.5px dashed rgba(29,158,117,.2);border-radius:var(--r1);
+  padding:18px;display:flex;flex-direction:column;align-items:center;gap:7px;cursor:pointer;
+  color:var(--t3);font-size:12px;font-weight:600;transition:border-color .15s}
+.img-upload-btn:active{border-color:var(--em)}
+
+/* SAVE BTN */
+.save-btn{width:100%;padding:17px;background:var(--em);color:#fff;font-size:16px;
+  font-weight:700;border:none;border-radius:var(--r2);cursor:pointer;margin-top:18px;
+  letter-spacing:.04em;font-family:'Inter',sans-serif;transition:all .15s;
+  box-shadow:0 4px 20px rgba(29,158,117,.25)}
+.save-btn:active{opacity:.88;transform:scale(.99)}
+
+/* EXPORT BTN */
+.export-btn{display:flex;align-items:center;justify-content:center;gap:7px;
+  background:var(--s2);border:1px solid var(--bdr2);color:var(--t2);
+  padding:11px 18px;border-radius:var(--r1);font-size:13px;font-weight:700;cursor:pointer;
+  font-family:'Inter',sans-serif;transition:all .15s}
+.export-btn:active{background:var(--s3);color:var(--t1)}
+
+/* TRADE CARDS */
+.trade-card{background:var(--s2);border-radius:var(--r2);border:0.5px solid var(--bdr);
+  padding:14px;margin-bottom:8px;cursor:pointer;transition:border-color .15s,transform .1s;
+  position:relative;overflow:hidden}
+.trade-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:var(--r2) 0 0 var(--r2)}
+.trade-card.win-row::before{background:var(--em)}
+.trade-card.loss-row::before{background:var(--rose)}
+.trade-card.be-row::before{background:var(--amber)}
+.trade-card:active{transform:scale(.99)}
+.t-top{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px}
+.t-chips{display:flex;flex-wrap:wrap;gap:5px}
+.chip{padding:4px 9px;border-radius:99px;font-size:10px;font-weight:700;letter-spacing:.04em}
+.chip.buy{background:var(--em2);color:var(--em);border:1px solid rgba(0,229,160,.2)}
+.chip.sell{background:var(--rose2);color:var(--rose);border:1px solid rgba(255,77,109,.2)}
+.chip.sess{background:rgba(24,95,165,.07);color:var(--blue);border:0.5px solid rgba(24,95,165,.15);font-size:9px}
+.chip.tech{background:rgba(167,139,250,.08);color:#A78BFA;border:1px solid rgba(167,139,250,.15);font-size:9px}
+.chip.tf{background:var(--s3);color:var(--t3);border:1px solid var(--bdr);font-size:9px}
+.t-right{text-align:right}
+.t-pnl{font-family:'DM Mono',monospace;font-size:17px;font-weight:600;letter-spacing:-.01em}
+.t-pnl.win{color:var(--em)}
+.t-pnl.loss{color:var(--rose)}
+.t-pnl.be{color:var(--amber)}
+.t-badge{display:inline-block;padding:2px 8px;border-radius:4px;font-size:9px;font-weight:700;margin-top:3px;letter-spacing:.05em}
+.t-badge.win{background:var(--em2);color:var(--em)}
+.t-badge.loss{background:var(--rose2);color:var(--rose)}
+.t-badge.be{background:rgba(255,159,28,.1);color:var(--amber)}
+.t-details{display:flex;justify-content:space-between;border-top:1px solid var(--bdr);padding-top:10px}
+.t-det{text-align:center}
+.t-det-label{font-size:9px;color:var(--t3);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:3px}
+.t-det-val{font-family:'DM Mono',monospace;font-size:12px;font-weight:500;color:var(--t2)}
+.stars{color:#BA7517;font-size:11px;letter-spacing:-1px}
+
+/* FILTER */
+.filter-row{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px;margin-bottom:12px}
+.filter-row::-webkit-scrollbar{display:none}
+.fchip{padding:7px 13px;border-radius:99px;font-size:11px;font-weight:700;white-space:nowrap;
+  cursor:pointer;border:1px solid var(--bdr);background:var(--s2);color:var(--t3);flex-shrink:0;transition:all .15s}
+.fchip.active{background:var(--em2);border-color:rgba(29,158,117,.25);color:var(--em)}
+
+/* EMPTY */
+.empty{text-align:center;padding:60px 20px;color:var(--t3)}
+.empty-icon{font-size:44px;margin-bottom:12px;opacity:.3}
+.empty-txt{font-size:13px;line-height:1.7;font-weight:500}
+
+/* MODAL */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;
+  display:flex;align-items:flex-end;justify-content:center;opacity:0;pointer-events:none;transition:opacity .2s}
+.modal-overlay.open{opacity:1;pointer-events:auto}
+.modal{background:var(--s1);border-radius:var(--r4) var(--r4) 0 0;
+  padding:20px 18px calc(20px + env(safe-area-inset-bottom,0px));
+  width:100%;max-width:480px;max-height:87vh;overflow-y:auto;
+  transform:translateY(20px);transition:transform .25s;border-top:0.5px solid var(--bdr)}
+.modal-overlay.open .modal{transform:translateY(0)}
+.modal::-webkit-scrollbar{display:none}
+.modal-handle{width:36px;height:4px;background:var(--s4);border-radius:99px;margin:0 auto 16px}
+.modal-title{font-size:17px;font-weight:700;margin-bottom:16px;color:var(--t1);display:flex;justify-content:space-between;align-items:center}
+.modal-close{background:none;border:none;color:var(--t3);font-size:24px;cursor:pointer;line-height:1}
+.det-row{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px;margin-bottom:12px}
+.det-cell{background:var(--s2);border-radius:var(--r1);padding:10px;border:1px solid var(--bdr)}
+.det-lbl{font-size:9px;color:var(--t3);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+.det-val{font-family:'DM Mono',monospace;font-size:13px;font-weight:500;color:var(--t2)}
+.det-cell.span2{grid-column:span 2}
+.del-btn{width:100%;padding:13px;background:none;border:1px solid rgba(255,77,109,.25);color:var(--rose);
+  border-radius:var(--r1);font-size:14px;font-weight:700;cursor:pointer;margin-top:8px;font-family:'Inter',sans-serif}
+.edit-btn{background:var(--em2);border:0.5px solid rgba(29,158,117,.25);color:var(--em);
+  padding:7px 16px;border-radius:8px;font-size:12px;font-weight:700;cursor:pointer;font-family:'Inter',sans-serif}
+
+/* MONTHLY */
+.month-nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px}
+.mnav-btn{background:var(--s2);border:1px solid var(--bdr);color:var(--t2);width:38px;height:38px;
+  border-radius:var(--r1);cursor:pointer;font-size:18px;display:flex;align-items:center;justify-content:center;font-family:'Inter',sans-serif}
+.month-label{font-size:17px;font-weight:700;color:var(--t1)}
+.m-kpi-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:12px}
+.m-kpi{background:var(--s2);border-radius:var(--r2);padding:12px;text-align:center;border:1px solid var(--bdr)}
+.m-kpi-val{font-family:'DM Mono',monospace;font-size:17px;font-weight:600;margin-bottom:3px}
+.m-kpi-label{font-size:9px;color:var(--t3);font-weight:700;text-transform:uppercase;letter-spacing:.06em}
+
+/* CALENDAR */
+.cal{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;width:100%}
+.cal-head{font-size:9px;color:var(--t3);text-align:center;padding:4px 0;font-weight:700;letter-spacing:.04em}
+.cal-day{aspect-ratio:1;border-radius:6px;display:flex;align-items:center;justify-content:center;
+  font-size:11px;font-weight:600;min-width:0;overflow:hidden;width:100%;font-family:'DM Mono',monospace}
+.cal-day.empty{background:transparent;pointer-events:none;aspect-ratio:unset;height:0;padding:0;overflow:hidden}
+.cal-day.none{background:var(--s3);color:var(--t3);opacity:0.55}
+.cal-day.win{background:rgba(0,229,160,.15);color:var(--em)}
+.cal-day.loss{background:rgba(255,77,109,.15);color:var(--rose)}
+.cal-day.be{background:rgba(255,159,28,.12);color:var(--amber)}
+.cal-day.today{outline:2px solid var(--gold)}
+.cal-legend{display:flex;gap:12px;margin-top:10px;flex-wrap:wrap}
+.cal-legend span{font-size:11px;color:var(--t3);display:flex;align-items:center;gap:4px;font-weight:500}
+
+.note-area{width:100%;min-height:80px;background:var(--s2);border:1px solid var(--bdr);
+  border-radius:var(--r1);padding:13px 14px;font-size:14px;color:var(--t1);
+  font-family:'Inter',sans-serif;outline:none;transition:border-color .15s;resize:vertical}
+.note-area:focus{border-color:var(--em)}
+.note-area::placeholder{color:var(--t3)}
+
+/* ── PORTFOLIO ── */
+.port-hero{background:var(--s1);border-radius:var(--r3);border:0.5px solid var(--bdr);padding:18px;margin-bottom:8px;position:relative;overflow:hidden}
+.ph-bg{display:none}
+.ph-label{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);margin-bottom:8px}
+.ph-main{display:flex;align-items:flex-end;gap:10px;margin-bottom:12px}
+.ph-amount{font-size:38px;font-weight:600;letter-spacing:-.02em;line-height:1}
+.ph-right{padding-bottom:5px}
+.ph-growth{font-size:12px;font-weight:700;padding:3px 9px;border-radius:99px;display:inline-block;margin-bottom:4px}
+.ph-growth.pos{background:var(--em2);color:var(--em);border:1px solid rgba(0,229,160,.2)}
+.ph-growth.neg{background:var(--rose2);color:var(--rose);border:1px solid rgba(255,77,109,.2)}
+.ph-from{font-size:10px;color:var(--t3)}
+.ph-bars{display:flex;gap:3px;align-items:flex-end;height:36px;margin-bottom:12px}
+.ph-bar{flex:1;border-radius:3px 3px 0 0;min-height:3px}
+.ph-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:7px}
+.ph-stat{text-align:center;background:rgba(255,255,255,.03);border-radius:8px;padding:8px}
+.ph-stat-val{font-size:13px;font-weight:600;margin-bottom:2px}
+.ph-stat-label{font-size:9px;color:var(--t3);font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.port-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
+.port-action-btn{border-radius:var(--r2);padding:14px;text-align:center;cursor:pointer;font-size:14px;font-weight:700;font-family:'Inter',sans-serif}
+.port-action-btn.deposit{background:rgba(29,158,117,.08);border:0.5px solid rgba(29,158,117,.2);color:var(--em)}
+.port-action-btn.withdraw{background:var(--rose2);border:1px solid rgba(255,77,109,.18);color:var(--rose)}
+.tx-item{display:flex;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid var(--bdr)}
+.tx-item:last-child{border-bottom:none}
+.tx-icon{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
+.tx-mid{flex:1;min-width:0}
+.tx-title{font-size:13px;font-weight:600;color:var(--t1);margin-bottom:2px}
+.tx-sub{font-size:11px;color:var(--t3)}
+.tx-amount{font-family:'DM Mono',monospace;font-size:14px;font-weight:600;flex-shrink:0}
+
+
+/* TOAST */
+.toast{position:fixed;top:calc(env(safe-area-inset-top,0px) + 62px);left:50%;
+  transform:translateX(-50%) translateY(-16px);background:var(--s2);border:1px solid var(--bdr2);
+  border-radius:var(--r2);padding:11px 20px;font-size:13px;font-weight:700;color:var(--t1);
+  z-index:300;opacity:0;transition:all .25s;white-space:nowrap;pointer-events:none;
+  box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+/* BEST/WORST */
+.bw-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.bw-card{border-radius:var(--r2);padding:12px;border:1px solid}
+.bw-card.best{background:rgba(0,229,160,.06);border-color:rgba(0,229,160,.15)}
+.bw-card.worst{background:rgba(255,77,109,.06);border-color:rgba(255,77,109,.15)}
+.bw-label{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;margin-bottom:6px}
+.bw-label.best{color:var(--em)}
+.bw-label.worst{color:var(--rose)}
+.bw-val{font-family:'DM Mono',monospace;font-size:18px;font-weight:600}
+.bw-val.best{color:var(--em)}
+.bw-val.worst{color:var(--rose)}
+.bw-sub{font-size:10px;color:var(--t3);margin-top:3px}
+
+/* ── SETTINGS ── */
+.sett-profile{display:flex;align-items:center;gap:12px;background:var(--s2);border-radius:var(--r2);padding:14px;margin-bottom:14px;border:1px solid var(--bdr)}
+.sett-avatar{width:44px;height:44px;border-radius:12px;background:#e67e22;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:16px;color:#fff;flex-shrink:0}
+.sett-name{font-weight:700;font-size:15px;color:var(--t1)}
+.sett-email{font-size:12px;color:var(--t3);margin-top:2px}
+.sett-google{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--blue);margin-top:4px}
+.sett-gdot{width:6px;height:6px;border-radius:50%;background:var(--blue);display:inline-block}
+.sett-sec{font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--t3);margin:12px 0 6px;padding-left:2px}
+.sett-group{background:var(--s2);border-radius:var(--r2);overflow:hidden;border:0.5px solid var(--bdr);margin-bottom:4px}
+.sett-row{display:flex;align-items:center;gap:10px;padding:12px 14px;border-bottom:1px solid var(--bdr);cursor:pointer;transition:background .15s}
+.sett-row:last-child{border-bottom:none}
+.sett-row:active{background:var(--s3)}
+.sett-icon{width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.sett-blue{background:rgba(77,166,255,.12);color:#4DA6FF}
+.sett-green{background:rgba(0,229,160,.1);color:#00E5A0}
+.sett-orange{background:rgba(255,159,28,.12);color:#FF9F1C}
+.sett-red{background:rgba(255,77,109,.1);color:#FF4D6D}
+.sett-amber{background:rgba(0,229,160,.1);color:#00E5A0}
+.sett-teal{background:rgba(48,196,196,.12);color:#30C8B0}
+.sett-purple{background:rgba(167,139,250,.12);color:#A78BFA}
+.sett-pink{background:rgba(255,108,176,.12);color:#FF6CB0}
+.sett-gray{background:rgba(144,144,176,.1);color:#8888B0}
+.sett-mid{flex:1;min-width:0}
+.sett-row-title{font-size:14px;font-weight:600;color:var(--t1)}
+.sett-row-sub{font-size:11px;color:var(--t3);margin-top:1px}
+.sett-chev{color:var(--t3);flex-shrink:0;opacity:.6}
+.sett-val-red{font-family:'DM Mono',monospace;font-size:13px;color:var(--rose);font-weight:600;flex-shrink:0;margin-right:4px}
+.sett-toggle{width:44px;height:26px;border-radius:13px;position:relative;cursor:pointer;flex-shrink:0;transition:background .2s;border:none}
+.sett-toggle.on{background:#34c759}
+.sett-toggle.off{background:rgba(255,255,255,.12)}
+.sett-knob{position:absolute;top:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:left .2s}
+.sett-toggle.on .sett-knob{left:21px}
+.sett-toggle.off .sett-knob{left:3px}
+.sett-lang-badge{background:var(--s3);border:1px solid var(--bdr2);border-radius:8px;padding:5px 10px;font-size:12px;font-weight:600;color:var(--t2);flex-shrink:0}
+
+/* SETTINGS TOGGLE */
+.sett-toggle{width:44px;height:26px;border-radius:99px;background:var(--s3);position:relative;cursor:pointer;flex-shrink:0;transition:background .2s;border:1px solid var(--bdr2)}
+.sett-toggle.on{background:var(--em)}
+.sett-toggle-dot{width:18px;height:18px;border-radius:50%;background:white;position:absolute;top:3px;left:3px;transition:left .18s;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+/* sett-icon colors defined above */
+/* MONTH NAV CENTER */
+.month-nav{display:flex;justify-content:center;align-items:center;gap:16px;margin-bottom:14px}
+/* MONTHLY TABS */
+.mv-tab{flex:1;padding:8px 4px;border-radius:9px;font-size:12px;font-weight:700;border:none;background:transparent;color:var(--t3);cursor:pointer;font-family:'Inter',sans-serif;transition:all .15s}
+.mv-tab.active{background:var(--s1);color:var(--em);box-shadow:0 1px 4px rgba(0,0,0,.2)}
+</style>
+</head>
+<body>
+
+
+<!-- GOOGLE LOGIN SCREEN -->
+<div id="google-login-screen" style="display:flex;position:fixed;inset:0;background:var(--bg);z-index:9999;flex-direction:column;align-items:center;justify-content:center;gap:20px">
+  <div style="width:60px;height:60px;border-radius:18px;background:linear-gradient(135deg,var(--gold),#d4a017);display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:900;color:#0d1117">J</div>
+  <div style="text-align:center">
+    <div style="font-size:20px;font-weight:800;color:var(--t1);margin-bottom:6px">XAUUSD Journal</div>
+    <div style="font-size:13px;color:var(--t3)">Sign in to access your trading journal</div>
+  </div>
+  <button onclick="signInWithGoogle()" style="display:flex;align-items:center;gap:10px;background:var(--s2);border:1px solid var(--bdr);border-radius:14px;padding:14px 24px;color:var(--t1);font-size:14px;font-weight:600;cursor:pointer;font-family:'Inter',sans-serif;margin-top:8px">
+    <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.5 0 6.6 1.2 9 3.2l6.7-6.7C35.7 2.4 30.2 0 24 0 14.7 0 6.9 5.4 3.2 13.2l7.8 6C12.7 13.1 17.9 9.5 24 9.5z"/><path fill="#4285F4" d="M46.5 24.5c0-1.6-.1-3.1-.4-4.5H24v8.5h12.7c-.6 3-2.3 5.5-4.8 7.2l7.5 5.8c4.4-4.1 7.1-10.1 7.1-17z"/><path fill="#FBBC05" d="M11 28.7c-.5-1.5-.8-3-.8-4.7s.3-3.2.8-4.7l-7.8-6C1.2 16.5 0 20.1 0 24s1.2 7.5 3.2 10.7l7.8-6z"/><path fill="#34A853" d="M24 48c6.2 0 11.4-2 15.2-5.5l-7.5-5.8c-2.1 1.4-4.7 2.3-7.7 2.3-6.1 0-11.3-3.6-13-8.7l-7.8 6C6.9 42.6 14.7 48 24 48z"/></svg>
+    Continue with Google
+  </button>
+</div>
+
+<!-- PIN LOCK SCREEN -->
+<div id="pin-lock" style="display:none;position:fixed;inset:0;background:var(--bg);z-index:9998;flex-direction:column;align-items:center;justify-content:center;gap:20px">
+  <div style="font-size:32px"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="11" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+  <div style="font-size:16px;font-weight:700;color:var(--t1)">XAUUSD Journal</div>
+  <div style="font-size:12px;color:var(--t3);margin-top:-8px" id="pin-sub-text">ใส่ PIN เพื่อเข้าใช้งาน</div>
+  <div id="pin-dots" style="display:flex;gap:14px;margin:10px 0">
+    <div class="pin-dot"></div><div class="pin-dot"></div>
+    <div class="pin-dot"></div><div class="pin-dot"></div>
+  </div>
+  <div id="pin-error" style="font-size:12px;color:var(--rose);min-height:18px"></div>
+  <div style="display:grid;grid-template-columns:repeat(3,72px);gap:10px">
+    <button class="pin-key" onclick="pinPress('1')">1</button>
+    <button class="pin-key" onclick="pinPress('2')">2</button>
+    <button class="pin-key" onclick="pinPress('3')">3</button>
+    <button class="pin-key" onclick="pinPress('4')">4</button>
+    <button class="pin-key" onclick="pinPress('5')">5</button>
+    <button class="pin-key" onclick="pinPress('6')">6</button>
+    <button class="pin-key" onclick="pinPress('7')">7</button>
+    <button class="pin-key" onclick="pinPress('8')">8</button>
+    <button class="pin-key" onclick="pinPress('9')">9</button>
+    <button class="pin-key" style="background:none;border-color:transparent"></button>
+    <button class="pin-key" onclick="pinPress('0')">0</button>
+    <button class="pin-key" onclick="pinBackspace()" style="font-size:18px">⌫</button>
+  </div>
+</div>
+<style>
+.pin-dot{width:14px;height:14px;border-radius:50%;background:var(--s3);border:2px solid var(--bdr2);transition:background .15s}
+.pin-dot.filled{background:var(--gold);border-color:var(--em)}
+.pin-key{width:72px;height:72px;border-radius:50%;background:var(--s2);border:1px solid var(--bdr);color:var(--t1);font-size:22px;font-weight:600;cursor:pointer;font-family:'Inter',sans-serif;transition:background .1s}
+.pin-key:active{background:var(--s3)}
+</style>
+
+<div class="app">
+  <!-- TOP BAR -->
+  <div class="topbar">
+    <div class="tb-inner">
+      <div class="tb-left">
+        <div class="tb-title"><span class="tb-dot"></span><span id="tb-title">XAUUSD Journal</span></div>
+        <div class="tb-sub" id="tb-sub"></div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="tb-badge" id="tb-badge"></div>
+        <button id="tb-settings-btn" onclick="openSettings()" style="display:none;background:none;border:none;width:34px;height:34px;color:var(--t2);cursor:pointer;align-items:center;justify-content:center;padding:0;transition:color .15s" onmouseover="this.style.color='var(--t1)'" onmouseout="this.style.color='var(--t2)'"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></button>
+      </div>
+    </div>
+  </div>
+
+  <div class="screens">
+
+    <!-- ══ DASHBOARD ══ -->
+    <div class="screen active" id="screen-dash">
+      <div class="wr-hero" id="wr-hero">
+        <div class="wr-hero-bg"></div>
+        <div class="wr-hero-top">
+          <div class="wr-hero-label" id="sec-wr">Overall Win Rate</div>
+          <div class="wr-hero-streak" id="wr-streak">—</div>
+        </div>
+        <div class="wr-hero-main">
+          <div class="wr-hero-num mid" id="wr-num">0%</div>
+          <div class="wr-hero-right">
+            <div class="wr-hero-pnl pos" id="wr-pnl">$0.00</div>
+            <div class="wr-hero-trades" id="wr-trades">0 trades</div>
+          </div>
+        </div>
+        <div class="wr-bar-wrap"><div class="wr-bar-fill" id="wr-fill" style="width:0%"></div></div>
+        <div class="wr-stats">
+          <div class="wr-stat"><div class="wr-stat-val w" id="ws-w">0</div><div class="wr-stat-label" id="ws-label-win">Win</div></div>
+          <div class="wr-stat"><div class="wr-stat-val l" id="ws-l">0</div><div class="wr-stat-label" id="ws-label-loss">Loss</div></div>
+          <div class="wr-stat"><div class="wr-stat-val b" id="ws-b">0</div><div class="wr-stat-label">BE</div></div>
+          <div class="wr-stat"><div class="wr-stat-val n" id="ws-rr">—</div><div class="wr-stat-label" id="ws-label-rr">Avg RR</div></div>
+          <div class="wr-stat"><div class="wr-stat-val n" id="ws-pf">—</div><div class="wr-stat-label" id="ws-label-pf">P.Factor</div></div>
+        </div>
+      </div>
+
+      <div id="loss-warn-wrap"></div>
+
+      <div class="kpi-grid">
+        <div class="kpi g"><div class="kpi-label" id="kpi-label-pnl">Net P&amp;L</div><div class="kpi-val pos" id="kpi-pnl">$0.00</div><div class="kpi-sub" id="kpi-pnl-sub">—</div></div>
+        <div class="kpi e"><div class="kpi-label" id="kpi-label-best">Best Trade</div><div class="kpi-val pos" id="kpi-best">—</div><div class="kpi-sub" id="kpi-worst-sub">Worst: —</div></div>
+        <div class="kpi b"><div class="kpi-label" id="kpi-label-rr">Avg RR</div><div class="kpi-val w" id="kpi-rr">—</div><div class="kpi-sub" id="kpi-rr-sub">—</div></div>
+        <div class="kpi p"><div class="kpi-label" id="kpi-label-pf">Profit Factor</div><div class="kpi-val pos" id="kpi-pf">—</div><div class="kpi-sub" id="kpi-streak-sub">Streak: —</div></div>
+      </div>
+
+      <div class="sec"><span id="sec-equity">Equity Curve</span></div>
+      <div class="card" style="padding:14px"><div class="chart-wrap"><canvas id="eq-canvas"></canvas></div></div>
+
+      <div class="sec"><span id="sec-session">Win Rate by Session</span></div>
+      <div class="card" id="sess-chart"></div>
+
+      <div class="sec"><span id="sec-tech">Win Rate by Technique</span></div>
+      <div class="card" id="tech-chart"></div>
+
+      <div class="sec"><span id="sec-ms">Win Rate by Market Structure</span></div>
+      <div class="card" id="ms-chart"></div>
+
+      <div style="height:8px"></div>
+    </div>
+
+    <!-- ══ LOG ══ -->
+    <div class="screen" id="screen-log">
+      <div class="filter-row" id="filter-row">
+        <div class="fchip active" data-filter="all" id="fchip-all">ทั้งหมด</div>
+        <div class="fchip" data-filter="WIN" id="fchip-win">WIN</div>
+        <div class="fchip" data-filter="LOSS" id="fchip-loss">LOSS</div>
+        <div class="fchip" data-filter="BE" id="fchip-be">BE</div>
+        <div class="fchip" data-filter="BUY" id="fchip-buy">BUY</div>
+        <div class="fchip" data-filter="SELL" id="fchip-sell">SELL</div>
+      </div>
+      <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
+        <button class="export-btn" onclick="exportCSV()">⬇ Export CSV</button>
+      </div>
+      <div id="trade-list"></div>
+    </div>
+
+    <!-- ══ NEW TRADE ══ -->
+    <div class="screen" id="screen-new"><div class="fsec"><div class="fsec-line"></div><div class="fsec-label">Context</div><div class="fsec-line"></div></div>
+
+      <div class="bs-row">
+        <div class="bs-btn buy active" id="btn-buy" onclick="selectBS('BUY')">▲ BUY</div>
+        <div class="bs-btn sell" id="btn-sell" onclick="selectBS('SELL')">▼ SELL</div>
+      </div>
+
+      <div class="g2">
+        <div class="form-row"><label class="form-label" id="f-label-date">Date</label><input class="form-input" type="date" id="f-date"></div>
+        <div class="form-row"><label class="form-label" id="f-label-tf">TF</label>
+          <select class="form-input" id="f-tf">
+            <option>M1</option><option>M5</option><option>M15</option><option selected>M30</option>
+            <option>H1</option><option>H4</option><option>D1</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-row"><label class="form-label" id="f-label-session">Session</label>
+        <select class="form-input" id="f-session">
+          <option>London AM (05-13)</option><option>London PM (13-18)</option>
+          <option>NY Open (19-23)</option><option>NY Late (23-04)</option>
+        </select>
+      </div>
+      <div class="form-row"><label class="form-label" id="f-label-ms">Market Structure</label>
+        <div class="chip-group" id="ms-group">
+          <div class="sch" data-val="เทรนขึ้น">เทรนขึ้น</div><div class="sch" data-val="เทรนลง">เทรนลง</div>
+          <div class="sch" data-val="SW ยกขึ้น">SW ยกขึ้น</div><div class="sch" data-val="SW กดลง">SW กดลง</div>
+          <div class="sch" data-val="ภูเขาโซนล่าง">ภูเขาโซนล่าง</div><div class="sch" data-val="ภูเขาโซนบน">ภูเขาโซนบน</div>
+          <div class="sch" data-val="ไม่ชัด">ไม่ชัด</div>
+        </div>
+      </div>
+      <div class="form-row"><label class="form-label" id="f-label-tech">Technique</label>
+        <div class="chip-group" id="tech-group">
+          <div class="sch" data-val="ในกรอบ">ในกรอบ</div><div class="sch" data-val="ไม้รวย">ไม้รวย</div>
+          <div class="sch" data-val="แนวเด้ง">แนวเด้ง</div><div class="sch" data-val="ตามแรง">ตามแรง</div>
+          <div class="sch" data-val="ตามเจ้า">ตามเจ้า</div><div class="sch" data-val="ปลายไส้">ปลายไส้</div>
+        </div>
+      </div>
+
+      <div class="form-row"><label class="form-label" id="f-label-entry">Entry Price</label><input class="form-input" type="number" id="f-entry" placeholder="3328.40" step="0.01" oninput="calcRR();autoCalcTPSL()"></div>
+      <div class="g2">
+        <div class="form-row">
+          <label class="form-label" id="f-label-sl">SL (ระยะ pips)</label>
+          <div style="position:relative">
+            <input class="form-input" type="number" id="f-sl-dist" placeholder="20" step="0.1" oninput="calcRR();autoCalcTPSL()" style="padding-right:60px">
+            <span id="f-sl-price" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:11px;color:var(--rose);font-family:'DM Mono',monospace;font-weight:600;pointer-events:none">—</span>
+          </div>
+        </div>
+        <div class="form-row">
+          <label class="form-label" id="f-label-tp">TP (ระยะ pips)</label>
+          <div style="position:relative">
+            <input class="form-input" type="number" id="f-tp-dist" placeholder="40" step="0.1" oninput="calcRR();autoCalcTPSL()" style="padding-right:60px">
+            <span id="f-tp-price" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:11px;color:var(--em);font-family:'DM Mono',monospace;font-weight:600;pointer-events:none">—</span>
+          </div>
+        </div>
+      </div>
+      <input type="hidden" id="f-sl">
+      <input type="hidden" id="f-tp">
+      <div class="g2">
+        <div class="form-row"><label class="form-label" id="f-label-lot">Lot Size</label><input class="form-input" type="number" id="f-lot" placeholder="0.10" step="0.01" oninput="calcRR()"></div>
+        <div class="form-row"><label class="form-label" id="f-label-pipp">$ per pip</label><input class="form-input" type="number" id="f-pipp" value="10" step="0.1" oninput="calcRR()"></div>
+      </div>
+      <div class="auto-calc">
+        <div class="ac-item"><div class="ac-label" id="ac-label-rr">RR Ratio</div><div class="ac-val" id="ac-rr">—</div></div>
+        <div class="ac-item"><div class="ac-label" id="ac-label-pips">Pips SL</div><div class="ac-val" id="ac-pips">—</div></div>
+        <div class="ac-item"><div class="ac-label" id="ac-label-pl">Est. P/L</div><div class="ac-val" id="ac-pl">—</div></div>
+      </div>
+
+      <div class="fsec"><div class="fsec-line"></div><div class="fsec-label">Result</div><div class="fsec-line"></div></div>
+
+      <div class="form-row"><label class="form-label" id="f-label-outcome">Outcome</label>
+        <div class="res-row">
+          <div class="res-btn win-btn active" id="res-win" onclick="selectResult('WIN')">WIN</div>
+          <div class="res-btn loss-btn" id="res-loss" onclick="selectResult('LOSS')">LOSS</div>
+          <div class="res-btn be-btn" id="res-be" onclick="selectResult('BE')">BE</div>
+        </div>
+      </div>
+      <div class="form-row"><label class="form-label" id="f-label-profit">Actual Profit/Loss ($)</label>
+        <input class="form-input" type="number" id="f-profit" placeholder="Auto หรือใส่เอง" step="0.01" style="font-size:18px;font-weight:700">
+      </div>
+      <div class="form-row"><label class="form-label" id="f-label-quality">Setup Quality</label>
+        <div class="star-row" id="star-row">
+          <button class="star" onclick="setStar(1)">★</button><button class="star" onclick="setStar(2)">★</button>
+          <button class="star" onclick="setStar(3)">★</button><button class="star" onclick="setStar(4)">★</button>
+          <button class="star" onclick="setStar(5)">★</button>
+        </div>
+      </div>
+
+      <div class="fsec"><div class="fsec-line"></div><div class="fsec-label">Review</div><div class="fsec-line"></div></div>
+
+      <div class="form-row"><label class="form-label" id="f-label-note">Note</label>
+        <textarea class="note-area" id="f-note" placeholder="Setup, what worked, what didn't..."></textarea>
+      </div>
+      <div class="form-row"><label class="form-label" id="f-label-screenshot">Screenshot</label>
+        <div id="img-upload-wrap">
+          <input type="file" id="f-img" accept="image/*" onchange="handleImg(this)" style="display:none">
+          <div class="img-upload-btn" onclick="document.getElementById('f-img').click()">
+            <span style="font-size:22px">📷</span><span>แตะเพื่อเพิ่มรูป</span>
+          </div>
+          <div id="img-preview-wrap" style="display:none;margin-top:8px;position:relative">
+            <img id="img-preview" style="width:100%;border-radius:var(--r1);display:block;max-height:200px;object-fit:cover">
+            <button onclick="clearImg()" style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.6);border:none;color:white;border-radius:99px;width:28px;height:28px;font-size:16px;cursor:pointer">×</button>
+          </div>
+        </div>
+      </div>
+      <button class="save-btn" id="save-btn-main" onclick="saveTrade()">บันทึก Trade →</button>
+    </div>
+
+    <!-- ══ MONTHLY ══ -->
+    <div class="screen" id="screen-monthly">
+      <!-- View tabs -->
+      <div style="display:flex;gap:6px;background:var(--s3);border-radius:12px;padding:4px;margin-bottom:14px">
+        <button class="mv-tab active" id="mv-tab-monthly" onclick="switchMonthlyView('monthly')">Monthly</button>
+        <button class="mv-tab" id="mv-tab-weekly" onclick="switchMonthlyView('weekly')">Weekly</button>
+        <button class="mv-tab" id="mv-tab-daily" onclick="switchMonthlyView('daily')">Daily</button>
+      </div>
+
+      <!-- Nav row with custom date pickers -->
+      <div class="month-nav" style="display:flex;justify-content:center;align-items:center;gap:10px;margin-bottom:14px">
+        <button class="mnav-btn" id="mv-prev" onclick="monthlyNavPrev()">←</button>
+        <!-- Custom Date Picker Button -->
+        <button id="dp-trigger" onclick="openDatePicker()" style="flex:1;background:var(--s2);border:1.5px solid var(--em);border-radius:12px;
+          padding:10px 14px;font-size:15px;font-weight:700;color:var(--t1);font-family:'Inter',sans-serif;
+          text-align:left;outline:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:8px;
+          transition:border-color .15s,background .15s">
+          <span id="dp-trigger-text" style="flex:1;text-align:center">—</span>
+        </button>
+        <button class="mnav-btn" id="mv-next" onclick="monthlyNavNext()">→</button>
+      </div>
+
+      <!-- Custom Date Picker Popup -->
+      <div id="dp-overlay" onclick="closeDatePicker()" style="display:none;position:fixed;inset:0;z-index:200;background:rgba(0,0,0,0.4);backdrop-filter:blur(2px)"></div>
+      <div id="dp-popup" style="display:none;position:fixed;left:50%;transform:translateX(-50%);z-index:201;
+        width:calc(min(100vw,480px) - 28px);max-width:452px;
+        background:var(--s1);border:1.5px solid var(--em);border-radius:20px;
+        padding:18px 16px 14px;box-shadow:0 20px 60px rgba(0,0,0,.5)">
+        <!-- Popup Header -->
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+          <button onclick="dpNavPrev()" style="width:34px;height:34px;border-radius:10px;background:var(--s3);border:0.5px solid var(--bdr2);color:var(--em);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center">‹</button>
+          <div id="dp-header-title" style="font-size:17px;font-weight:700;color:var(--t1);letter-spacing:-.01em"></div>
+          <button onclick="dpNavNext()" style="width:34px;height:34px;border-radius:10px;background:var(--s3);border:0.5px solid var(--bdr2);color:var(--em);font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center">›</button>
+        </div>
+        <!-- Calendar grid (for daily/monthly) -->
+        <div id="dp-grid-wrap">
+          <!-- Day headers -->
+          <div id="dp-day-headers" style="display:grid;grid-template-columns:repeat(7,1fr);margin-bottom:6px"></div>
+          <!-- Day cells -->
+          <div id="dp-day-grid" style="display:grid;grid-template-columns:repeat(7,1fr);gap:3px"></div>
+          <!-- Month grid (for month picker) -->
+          <div id="dp-month-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px"></div>
+        </div>
+      </div>
+
+      <!-- MONTHLY VIEW -->
+      <div id="mv-monthly">
+        <div class="m-kpi-grid">
+          <div class="m-kpi"><div class="m-kpi-val" id="m-pnl" style="color:var(--em)">$0</div><div class="m-kpi-label" id="m-kpi-pnl-label">Net P&amp;L</div></div>
+          <div class="m-kpi"><div class="m-kpi-val" id="m-wr" style="color:var(--em)">0%</div><div class="m-kpi-label" id="m-kpi-wr-label">Win Rate</div></div>
+          <div class="m-kpi"><div class="m-kpi-val" id="m-trades" style="color:var(--t1)">0</div><div class="m-kpi-label" id="m-kpi-trades-label">Trades</div></div>
+        </div>
+        <div class="sec"><span id="sec-best-worst">Best / Worst</span></div>
+        <div class="bw-grid" id="m-bw" style="margin-bottom:12px"></div>
+        <div class="sec"><span id="sec-cal">P&amp;L Calendar</span></div>
+        <div class="card" style="padding:10px;overflow:hidden">
+          <div class="cal" id="cal-grid"></div>
+          <div class="cal-legend">
+            <span><span style="color:var(--em)">●</span> <span id="cal-win-label">Win</span></span>
+            <span><span style="color:var(--rose)">●</span> <span id="cal-loss-label">Loss</span></span>
+            <span><span style="color:var(--amber)">●</span> <span id="cal-be-label">BE</span></span>
+            <span><span style="color:var(--t4)">●</span> <span id="cal-notrade-label">No trade</span></span>
+          </div>
+        </div>
+        <div class="sec"><span id="sec-breakdown">Breakdown</span></div>
+        <div class="card" id="m-breakdown"></div>
+        <div class="sec"><span id="sec-monthly-notes">Monthly Notes</span></div>
+        <textarea class="note-area" id="m-note" placeholder="Monthly reflection..." style="width:100%;min-height:100px" oninput="saveMonthNote()"></textarea>
+      </div>
+
+      <!-- WEEKLY VIEW -->
+      <div id="mv-weekly" style="display:none">
+        <div id="weekly-compare" style="background:var(--s2);border-radius:var(--r2);border:0.5px solid var(--bdr);padding:14px;margin-bottom:10px">
+          <div style="font-size:9px;color:var(--t3);font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px" id="wk-compare-label">เทียบกับสัปดาห์ก่อน</div>
+          <div style="display:flex;align-items:flex-end;gap:8px;margin-bottom:10px">
+            <div style="font-family:'DM Mono',monospace;font-size:28px;font-weight:600" id="wk-pnl">$0</div>
+            <div style="font-size:12px;color:var(--t3);padding-bottom:6px" id="wk-pnl-label">P&amp;L</div>
+            <div style="margin-left:auto;font-size:12px;font-weight:700;padding:4px 10px;border-radius:99px" id="wk-growth-badge">—</div>
+          </div>
+          <div class="m-kpi-grid">
+            <div class="m-kpi"><div class="m-kpi-val" id="wk-wr" style="color:var(--em)">0%</div><div class="m-kpi-label" id="wk-wr-label">อัตราชนะ</div><div style="font-size:10px;color:var(--t3);margin-top:3px" id="wk-wr-vs">—</div></div>
+            <div class="m-kpi"><div class="m-kpi-val" id="wk-net" style="color:var(--em)">$0</div><div class="m-kpi-label" id="wk-net-label">กำไร &amp; ขาดทุน</div><div style="font-size:10px;color:var(--t3);margin-top:3px" id="wk-net-vs">—</div></div>
+            <div class="m-kpi"><div class="m-kpi-val" id="wk-count" style="color:var(--t1)">0</div><div class="m-kpi-label" id="wk-trades-label">เทรด</div><div style="font-size:10px;color:var(--t3);margin-top:3px" id="wk-count-vs">—</div></div>
+          </div>
+        </div>
+        <div class="sec" id="wk-daily-sec">รายวัน</div>
+        <div id="wk-daily-bars" style="background:var(--s2);border-radius:var(--r2);border:0.5px solid var(--bdr);padding:12px;margin-bottom:10px;display:flex;gap:6px;align-items:flex-end;justify-content:space-between;min-height:80px"></div>
+        <div class="sec" id="wk-bestworst-sec">ดีที่สุด / แย่ที่สุด</div>
+        <div class="bw-grid" id="wk-bw" style="margin-bottom:10px"></div>
+      </div>
+
+      <!-- DAILY VIEW -->
+      <div id="mv-daily" style="display:none">
+        <div id="daily-list"></div>
+      </div>
+    </div>
+
+
+    <!-- ══ PORTFOLIO ══ -->
+    <div class="screen" id="screen-portfolio">
+
+      <!-- Hero -->
+      <div class="port-hero" id="port-hero">
+        <div class="ph-bg"></div>
+        <div class="ph-label" id="ph-label-el">ยอดพอร์ตปัจจุบัน</div>
+        <div class="ph-main">
+          <div class="ph-amount mono" id="ph-amount">$0.00</div>
+          <div class="ph-right">
+            <div class="ph-growth" id="ph-growth">+0%</div>
+            <div class="ph-from" id="ph-from">ทุนเริ่มต้น $0</div>
+          </div>
+        </div>
+        <div class="ph-bars" id="ph-bars"></div>
+        <div class="ph-stats">
+          <div class="ph-stat"><div class="ph-stat-val mono" id="ph-profit" style="color:var(--em)">$0</div><div class="ph-stat-label" id="ph-profit-label">กำไรสะสม</div></div>
+          <div class="ph-stat"><div class="ph-stat-val mono" id="ph-capital" style="color:var(--blue)">$0</div><div class="ph-stat-label" id="ph-capital-label">ทุนเริ่มต้น</div></div>
+          <div class="ph-stat"><div class="ph-stat-val mono" id="ph-withdrawn" style="color:var(--em)">$0</div><div class="ph-stat-label" id="ph-withdrawn-label">ถอนแล้ว</div></div>
+        </div>
+      </div>
+
+      <!-- Actions -->
+      <div class="port-actions">
+        <div class="port-action-btn deposit" onclick="openPortModal('deposit')" id="port-deposit-btn">
+          <div style="font-size:20px;margin-bottom:4px">＋</div><span id="port-deposit-label">เติมเงิน</span>
+        </div>
+        <div class="port-action-btn withdraw" onclick="openPortModal('withdraw')" id="port-withdraw-btn">
+          <div style="font-size:20px;margin-bottom:4px">－</div><span id="port-withdraw-label">ถอนเงิน</span>
+        </div>
+      </div>
+
+      <!-- Set initial capital if not set -->
+      <div id="port-setup" style="display:none">
+        <div class="card" style="text-align:center;padding:20px">
+          <div style="font-size:13px;color:var(--t2);margin-bottom:12px;line-height:1.6" id="port-setup-text">ยังไม่ได้ตั้งทุนเริ่มต้น<br>ใส่ยอดพอร์ตตอนเริ่มเทรดได้เลยครับ</div>
+          <div class="form-row" style="text-align:left">
+            <label class="form-label" id="port-init-label">ทุนเริ่มต้น ($)</label>
+            <input class="form-input mono" type="number" id="port-init-input" placeholder="2200" step="0.01">
+          </div>
+          <button class="save-btn" style="margin-top:12px" id="set-capital-btn" onclick="setInitCapital()">ตั้งทุนเริ่มต้น →</button>
+        </div>
+      </div>
+
+      <!-- Transaction history -->
+      <div class="sec" id="sec-tx">ประวัติ Transaction</div>
+      <div class="card" style="padding:0;overflow:hidden" id="port-tx-list">
+        <div class="empty" style="padding:30px 20px"><div class="empty-icon">💼</div><div class="empty-txt" id="no-tx-text">ยังไม่มี transaction</div></div>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- NAV -->
+  <nav class="nav">
+    <button class="nb active" onclick="goScreen('dash',this)" data-screen="dash">
+      <div class="nb-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></div>
+    </button>
+    <button class="nb" onclick="goScreen('log',this)" data-screen="log">
+      <div class="nb-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg></div>
+    </button>
+    <button class="nb nb-center" onclick="goScreen('new',this)" data-screen="new">
+      <div class="nb-plus"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg></div>
+    </button>
+    <button class="nb" onclick="goScreen('monthly',this)" data-screen="monthly">
+      <div class="nb-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg></div>
+    </button>
+    <button class="nb" onclick="goScreen('portfolio',this)" data-screen="portfolio">
+      <div class="nb-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12V8a2 2 0 0 0-2-2H4a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-2"/><path d="M20 12h-6a2 2 0 1 0 0 4h6"/></svg></div>
+    </button>
+  </nav>
+</div>
+
+<!-- EDIT MODAL -->
+<div class="modal-overlay" id="edit-modal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title"><span id="edit-modal-title">แก้ไข Trade</span> <button class="modal-close" onclick="closeEditModal()">×</button></div>
+    <div class="bs-row">
+      <div class="bs-btn buy" id="e-btn-buy" onclick="editSelectBS('BUY')">▲ BUY</div>
+      <div class="bs-btn sell" id="e-btn-sell" onclick="editSelectBS('SELL')">▼ SELL</div>
+    </div>
+    <div class="g2">
+      <div class="form-row"><label class="form-label">Date</label><input class="form-input" type="date" id="e-date"></div>
+      <div class="form-row"><label class="form-label">TF</label>
+        <select class="form-input" id="e-tf">
+          <option>M1</option><option>M5</option><option>M15</option><option>M30</option>
+          <option>H1</option><option>H4</option><option>D1</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-row"><label class="form-label">Session</label>
+      <select class="form-input" id="e-session">
+        <option>London AM (05-13)</option><option>London PM (13-18)</option>
+        <option>NY Open (19-23)</option><option>NY Late (23-04)</option>
+      </select>
+    </div>
+    <div class="form-row"><label class="form-label">Market Structure</label>
+      <div class="chip-group" id="e-ms-group">
+        <div class="sch" data-val="เทรนขึ้น">เทรนขึ้น</div><div class="sch" data-val="เทรนลง">เทรนลง</div>
+        <div class="sch" data-val="SW ยกขึ้น">SW ยกขึ้น</div><div class="sch" data-val="SW กดลง">SW กดลง</div>
+        <div class="sch" data-val="ภูเขาโซนล่าง">ภูเขาโซนล่าง</div><div class="sch" data-val="ภูเขาโซนบน">ภูเขาโซนบน</div>
+        <div class="sch" data-val="ไม่ชัด">ไม่ชัด</div>
+      </div>
+    </div>
+    <div class="form-row"><label class="form-label">Technique</label>
+      <div class="chip-group" id="e-tech-group">
+        <div class="sch" data-val="ในกรอบ">ในกรอบ</div><div class="sch" data-val="ไม้รวย">ไม้รวย</div>
+        <div class="sch" data-val="แนวเด้ง">แนวเด้ง</div><div class="sch" data-val="ตามแรง">ตามแรง</div>
+        <div class="sch" data-val="ตามเจ้า">ตามเจ้า</div><div class="sch" data-val="ปลายไส้">ปลายไส้</div>
+      </div>
+    </div>
+    <div class="g3">
+      <div class="form-row"><label class="form-label">Entry</label><input class="form-input" type="number" id="e-entry" step="0.01"></div>
+      <div class="form-row"><label class="form-label">SL</label><input class="form-input" type="number" id="e-sl" step="0.01"></div>
+      <div class="form-row"><label class="form-label">TP</label><input class="form-input" type="number" id="e-tp" step="0.01"></div>
+    </div>
+    <div class="g2">
+      <div class="form-row"><label class="form-label">Lot</label><input class="form-input" type="number" id="e-lot" step="0.01"></div>
+      <div class="form-row"><label class="form-label">Profit ($)</label><input class="form-input" type="number" id="e-profit" step="0.01"></div>
+    </div>
+    <div class="form-row"><label class="form-label">Outcome</label>
+      <div class="res-row">
+        <div class="res-btn win-btn" id="e-res-win" onclick="editSelectResult('WIN')">WIN</div>
+        <div class="res-btn loss-btn" id="e-res-loss" onclick="editSelectResult('LOSS')">LOSS</div>
+        <div class="res-btn be-btn" id="e-res-be" onclick="editSelectResult('BE')">BE</div>
+      </div>
+    </div>
+    <div class="form-row"><label class="form-label">Setup Quality</label>
+      <div class="star-row" id="e-star-row">
+        <button class="star" onclick="setEditStar(1)">★</button><button class="star" onclick="setEditStar(2)">★</button>
+        <button class="star" onclick="setEditStar(3)">★</button><button class="star" onclick="setEditStar(4)">★</button>
+        <button class="star" onclick="setEditStar(5)">★</button>
+      </div>
+    </div>
+    <div class="form-row"><label class="form-label">Note</label><textarea class="note-area" id="e-note" placeholder="Notes..."></textarea></div>
+    <div class="form-row"><label class="form-label">Screenshot</label>
+      <input type="file" id="e-img-input" accept="image/*" onchange="handleEditImg(this)" style="display:none">
+      <div id="e-img-upload-btn" class="img-upload-btn" onclick="document.getElementById('e-img-input').click()"><span style="font-size:20px">📷</span><span>เปลี่ยนรูป</span></div>
+      <div id="e-img-preview-wrap" style="display:none;margin-top:8px;position:relative">
+        <img id="e-img-preview" style="width:100%;border-radius:var(--r1);display:block;max-height:200px;object-fit:cover">
+        <button onclick="clearEditImg()" style="position:absolute;top:8px;right:8px;background:rgba(0,0,0,.6);border:none;color:white;border-radius:99px;width:28px;height:28px;font-size:16px;cursor:pointer">×</button>
+      </div>
+    </div>
+    <button class="save-btn" id="save-edit-btn" onclick="saveEdit()">บันทึกการแก้ไข ✓</button>
+    <button class="del-btn" id="delete-edit-btn" onclick="deleteFromEdit()">🗑 ลบ Trade นี้</button>
+  </div>
+</div>
+
+<!-- DETAIL MODAL -->
+<div class="modal-overlay" id="detail-modal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title"><span id="det-modal-title">Trade Detail</span>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="edit-btn" id="det-edit-btn">✏️ แก้ไข</button>
+        <button class="modal-close" onclick="closeModal()">×</button>
+      </div>
+    </div>
+    <div id="modal-content"></div>
+  </div>
+</div>
+
+
+
+<!-- PORTFOLIO MODAL -->
+<div class="modal-overlay" id="port-modal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title" id="port-modal-title">เติมเงิน <button class="modal-close" onclick="closePortModal()">×</button></div>
+    <div class="form-row">
+      <label class="form-label" id="port-modal-amount-label">จำนวนเงิน ($)</label>
+      <input class="form-input mono" type="number" id="port-modal-amount" placeholder="500.00" step="0.01" style="font-size:20px;font-weight:600">
+    </div>
+    <div class="form-row">
+      <label class="form-label" id="port-modal-note-label">Note (optional)</label>
+      <input class="form-input" type="text" id="port-modal-note" placeholder="เช่น โอนจาก Wise">
+    </div>
+    <button class="save-btn" id="port-modal-save" onclick="savePortTx()">บันทึก →</button>
+  </div>
+</div>
+
+<!-- DAY TRADES MODAL -->
+<div class="modal-overlay" id="day-modal">
+  <div class="modal">
+    <div class="modal-handle"></div>
+    <div class="modal-title"><span id="day-modal-title">Trade วันนี้</span><button class="modal-close" onclick="closeDayModal()">×</button></div>
+    <div id="day-modal-content"></div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<!-- SETTINGS MODAL -->
+<div class="modal-overlay" id="settings-modal">
+  <div class="modal" style="max-height:90vh;overflow-y:auto">
+    <div class="modal-handle"></div>
+    <div class="modal-title"><span id="sett-modal-title">Settings</span> <button class="modal-close" onclick="closeSettings()">×</button></div>
+
+    <!-- Profile Card -->
+    <div id="sett-profile-card" style="display:flex;align-items:center;gap:12px;background:var(--s1);border-radius:14px;border:1px solid var(--bdr);padding:13px;margin-bottom:14px">
+      <div id="sett-avatar" style="width:46px;height:46px;border-radius:13px;background:linear-gradient(135deg,var(--gold),#d4a017);display:flex;align-items:center;justify-content:center;font-size:17px;font-weight:800;color:#0d1117;flex-shrink:0;overflow:hidden">
+        <span id="sett-avatar-initials">NT</span>
+      </div>
+      <div style="flex:1;min-width:0">
+        <div id="sett-profile-name" style="font-size:14px;font-weight:700;color:var(--t1);margin-bottom:2px">Naitao</div>
+        <div id="sett-profile-email" style="font-size:11px;color:var(--t2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">naitao@gmail.com</div>
+        <div style="display:inline-flex;align-items:center;gap:4px;background:rgba(77,166,255,.07);border:1px solid rgba(77,166,255,.13);border-radius:5px;padding:2px 8px;font-size:9px;font-weight:600;color:var(--blue);margin-top:4px">
+          <span style="font-size:10px">G</span> Signed in with Google
+        </div>
+      </div>
+      <button onclick="signOut()" style="background:none;border:1px solid rgba(255,77,109,.2);border-radius:8px;padding:6px 12px;font-size:11px;font-weight:600;color:var(--rose);cursor:pointer;white-space:nowrap;font-family:'Inter',sans-serif">Sign out</button>
+    </div>
+
+    <!-- Account -->
+    <div class="sett-sec" id="sett-sec-account">Account</div>
+    <div class="sett-group">
+      <div class="sett-row" onclick="openSettProfile()">
+        <div class="sett-icon sett-blue"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-profile">Profile</div><div class="sett-row-sub" id="sett-sub-profile">ตั้งค่าโปรไฟล์</div></div>
+        <svg class="sett-chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </div>
+      <div id="sett-profile-panel" style="display:none;padding:0 14px 14px">
+        <div class="form-row" style="margin-top:10px;margin-bottom:8px">
+          <label class="form-label">ชื่อที่แสดง</label>
+          <input class="form-input" type="text" id="sett-name-input" placeholder="ชื่อของคุณ">
+        </div>
+        <button class="save-btn" style="margin-top:0;padding:13px" onclick="saveSettProfile()">บันทึก Profile →</button>
+      </div>
+
+      <div class="sett-row" onclick="openSettSecurity()">
+        <div class="sett-icon sett-purple"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="11" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-security">Security</div><div class="sett-row-sub" id="sett-pin-sub">PIN, Biometric lock</div></div>
+        <svg class="sett-chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </div>
+      <div id="sett-security-panel" style="display:none;padding:0 14px 14px">
+        <div style="margin-top:10px;margin-bottom:10px;font-size:12px;color:var(--t2);line-height:1.6">
+          ตั้ง PIN 4 หลัก เพื่อล็อคแอป — จะถูกขอทุกครั้งที่เปิดแอป
+        </div>
+        <div class="form-row" style="margin-bottom:8px">
+          <label class="form-label">PIN ใหม่ (4 หลัก)</label>
+          <input class="form-input mono" type="password" id="sett-pin-input" placeholder="••••" maxlength="4" inputmode="numeric" style="letter-spacing:.3em;font-size:22px">
+        </div>
+        <div class="form-row" style="margin-bottom:8px">
+          <label class="form-label">ยืนยัน PIN</label>
+          <input class="form-input mono" type="password" id="sett-pin-confirm" placeholder="••••" maxlength="4" inputmode="numeric" style="letter-spacing:.3em;font-size:22px">
+        </div>
+        <button class="save-btn" style="margin-top:0;padding:13px" onclick="saveSettPIN()">ตั้ง PIN →</button>
+        <button id="sett-clear-pin-btn" style="display:none;width:100%;padding:12px;margin-top:8px;background:none;border:1px solid rgba(255,77,109,.25);color:var(--rose);border-radius:var(--r1);font-size:13px;font-weight:600;cursor:pointer" onclick="clearPIN()">🔓 ลบ PIN ออก</button>
+      </div>
+
+      <div class="sett-row">
+        <div class="sett-icon sett-green"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 16 12 12 8 16"/><line x1="12" y1="12" x2="12" y2="21"/><path d="M20.39 18.39A5 5 0 0 0 18 9h-1.26A8 8 0 1 0 3 16.3"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-sync">Sync & Backup</div><div class="sett-row-sub" id="sett-sub-sync">Firebase · ออนไลน์</div></div>
+        <div class="sett-toggle" id="sett-sync-toggle" onclick="toggleSync()" style="background:var(--em)"><div class="sett-toggle-dot" style="left:19px"></div></div>
+      </div>
+    </div>
+
+    <!-- Journal Defaults -->
+    <div class="sett-sec" id="sett-sec-journal">Journal Defaults</div>
+    <div class="sett-group">
+      <div class="sett-row" onclick="openSettCapital()">
+        <div class="sett-icon sett-orange"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M9.5 9.5c0-1.4 1.1-2.5 2.5-2.5s2.5 1.1 2.5 2.5c0 3-5 3-5 5.5 0 1.4 1.1 2.5 2.5 2.5s2.5-1.1 2.5-2.5"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-capital">ทุนเริ่มต้น</div><div class="sett-row-sub" id="sett-cap-sub">$0.00</div></div>
+        <svg class="sett-chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </div>
+      <div id="sett-capital-panel" style="display:none;padding:0 14px 14px">
+        <div class="form-row" style="margin-top:10px;margin-bottom:8px">
+          <label class="form-label" id="sett-cap-label">ทุนเริ่มต้น ($)</label>
+          <input class="form-input mono" type="number" id="sett-cap-input" placeholder="2200" step="0.01">
+        </div>
+        <button class="save-btn" style="margin-top:0;padding:13px" onclick="saveSettCapital()">บันทึก →</button>
+      </div>
+
+      <div class="sett-row" onclick="openSettLossLimit()">
+        <div class="sett-icon sett-red"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-loss">Daily Loss Limit</div><div class="sett-row-sub" id="sett-daily-loss-sub">แจ้งเตือนเมื่อขาดทุนถึง</div></div>
+        <span class="sett-val-red" id="sett-loss-disp">-$300</span>
+        <svg class="sett-chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </div>
+      <div id="sett-loss-panel" style="display:none;padding:0 14px 14px">
+        <div class="form-row" style="margin-top:10px;margin-bottom:8px">
+          <label class="form-label">ขาดทุนสูงสุดต่อวัน ($)</label>
+          <input class="form-input mono" type="number" id="sett-loss-input" placeholder="300" step="1">
+        </div>
+        <button class="save-btn" style="margin-top:0;padding:13px;background:var(--rose);box-shadow:0 4px 16px rgba(255,77,109,.25)" onclick="saveSettLoss()">บันทึก →</button>
+      </div>
+    </div>
+
+    <!-- Customize Form -->
+    <div class="sett-sec" id="sett-sec-form">Customize Form</div>
+    <div class="sett-group">
+      <div class="sett-row" onclick="openSettTF()">
+        <div class="sett-icon sett-teal"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 15"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-tf">Timeframe (TF)</div><div class="sett-row-sub" id="sett-tf-sub">M1, M5, M15, M30, H1, H4, D1</div></div>
+        <svg class="sett-chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </div>
+      <div id="sett-tf-panel" style="display:none;padding:0 14px 14px">
+        <div style="margin-top:10px;margin-bottom:6px;font-size:11px;color:var(--t3);font-weight:600">กดเพื่อเพิ่ม/ลบ TF ที่ใช้</div>
+        <div class="chip-group" id="sett-tf-chips"></div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <input class="form-input" type="text" id="sett-tf-new" placeholder="เพิ่ม TF ใหม่..." style="padding:10px 12px;font-size:13px">
+          <button onclick="addCustomTF()" style="background:var(--gold2);border:1px solid rgba(29,158,117,.25);color:var(--em);padding:10px 14px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap">+ เพิ่ม</button>
+        </div>
+        <button class="save-btn" style="margin-top:10px;padding:13px" onclick="saveSettTF()">บันทึก TF →</button>
+      </div>
+
+      <div class="sett-row" onclick="openSettTech()">
+        <div class="sett-icon sett-purple"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-technique">Technique</div><div class="sett-row-sub" id="sett-tech-sub">ในกรอบ, ไม้รวย, แนวเด้ง...</div></div>
+        <svg class="sett-chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </div>
+      <div id="sett-tech-panel" style="display:none;padding:0 14px 14px">
+        <div style="margin-top:10px;margin-bottom:6px;font-size:11px;color:var(--t3);font-weight:600">กดเพื่อเพิ่ม/ลบ Technique</div>
+        <div class="chip-group" id="sett-tech-chips"></div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <input class="form-input" type="text" id="sett-tech-new" placeholder="เพิ่ม Technique ใหม่..." style="padding:10px 12px;font-size:13px">
+          <button onclick="addCustomTech()" style="background:var(--gold2);border:1px solid rgba(29,158,117,.25);color:var(--em);padding:10px 14px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap">+ เพิ่ม</button>
+        </div>
+        <button class="save-btn" style="margin-top:10px;padding:13px" onclick="saveSettTech()">บันทึก Technique →</button>
+      </div>
+
+      <div class="sett-row" onclick="openSettMS()">
+        <div class="sett-icon sett-pink"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-ms-sett">Market Structure</div><div class="sett-row-sub" id="sett-ms-sub">เทรนขึ้น, เทรนลง, SW...</div></div>
+        <svg class="sett-chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </div>
+      <div id="sett-ms-panel" style="display:none;padding:0 14px 14px">
+        <div style="margin-top:10px;margin-bottom:6px;font-size:11px;color:var(--t3);font-weight:600">กดเพื่อเพิ่ม/ลบ Market Structure</div>
+        <div class="chip-group" id="sett-ms-chips"></div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <input class="form-input" type="text" id="sett-ms-new" placeholder="เพิ่ม MS ใหม่..." style="padding:10px 12px;font-size:13px">
+          <button onclick="addCustomMS()" style="background:var(--gold2);border:1px solid rgba(29,158,117,.25);color:var(--em);padding:10px 14px;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;white-space:nowrap">+ เพิ่ม</button>
+        </div>
+        <button class="save-btn" style="margin-top:10px;padding:13px" onclick="saveSettMS()">บันทึก MS →</button>
+      </div>
+    </div>
+
+    <!-- Display -->
+    <div class="sett-sec" id="sett-sec-display">Display</div>
+    <div class="sett-group">
+      <div class="sett-row">
+        <div class="sett-icon sett-purple"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-theme">Theme</div><div class="sett-row-sub" id="sett-theme-sub">Dark mode</div></div>
+        <div class="sett-toggle" id="sett-theme-toggle" onclick="toggleTheme()"><div class="sett-toggle-dot"></div></div>
+      </div>
+      <div class="sett-row" onclick="toggleLang()">
+        <div class="sett-icon sett-blue"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 3a15.3 15.3 0 0 1 4 9 15.3 15.3 0 0 1-4 9 15.3 15.3 0 0 1-4-9 15.3 15.3 0 0 1 4-9z"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-lang">ภาษา / Language</div><div class="sett-row-sub" id="sett-lang-sub">ภาษาไทย</div></div>
+        <div id="sett-lang-badge" style="font-size:11px;font-weight:700;padding:4px 12px;border-radius:7px;background:rgba(24,95,165,.08);border:0.5px solid rgba(24,95,165,.2);color:var(--blue)">TH ไทย</div>
+      </div>
+    </div>
+
+    <!-- Data -->
+    <div class="sett-sec" id="sett-sec-data">Data</div>
+    <div class="sett-group">
+      <div class="sett-row" onclick="closeSettings();setTimeout(exportCSV,200)">
+        <div class="sett-icon sett-green"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" id="sett-row-export">Export CSV</div><div class="sett-row-sub" id="sett-sub-export">ดาวน์โหลด trade history</div></div>
+        <svg class="sett-chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </div>
+      <div class="sett-row" onclick="clearAllData()">
+        <div class="sett-icon sett-red"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6M9 6V4h6v2"/></svg></div>
+        <div class="sett-mid"><div class="sett-row-title" style="color:var(--rose)" id="sett-row-clear">Clear All Data</div><div class="sett-row-sub" id="sett-sub-clear">ลบข้อมูลทั้งหมด</div></div>
+        <svg class="sett-chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#FF4D6D" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+      </div>
+    </div>
+    <div style="height:8px"></div>
+  </div>
+</div>
+
+<script>
+// ── STATE ──
+Object.defineProperty(window,'trades',{get:()=>window._trades||[],set:v=>{window._trades=v},configurable:true});
+window._trades=[];
+let monthNotes={};
+let currentFilter='all';
+let formState={direction:'BUY',result:'WIN',ms:'',tech:'',stars:3,imgData:''};
+let editState={id:null,direction:'BUY',result:'WIN',ms:'',tech:'',stars:3,imgData:''};
+let currentDetailId=null;
+let currentViewYear,currentViewMonth;
+let riskVisible=true;
+
+// ── NAV ──
+function goScreen(id,btn){
+  document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
+  document.querySelectorAll('.nb').forEach(b=>b.classList.remove('active'));
+  document.getElementById('screen-'+id).classList.add('active');
+  btn.classList.add('active');
+  updateTopbar(id);
+  if(id==='dash') renderDash();
+  if(id==='log') renderLog();
+  if(id==='new') resetForm();
+  if(id==='monthly') renderMonthly();
+  if(id==='portfolio') renderPortfolio();
+}
+function updateTopbar(id){
+  const titles={dash:t('appTitle'),log:t('log'),new:t('newTrade'),monthly:t('monthly'),portfolio:t('port')};
+  document.getElementById('tb-title').textContent=titles[id]||'';
+  document.getElementById('tb-sub').textContent='';
+  const badge=document.getElementById('tb-badge');
+  const settBtn=document.getElementById('tb-settings-btn');
+  settBtn.style.display=id==='portfolio'?'flex':'none';
+  if(id==='dash'){
+    const tr=window.trades; const wr=tr.length?(tr.filter(t=>t.result==='WIN').length/tr.length*100):0;
+    badge.textContent=tr.length?wr.toFixed(0)+'% WR':'—';
+    badge.style.display='block';
+  } else if(id==='monthly'){
+    updateMonthlyBadge();
+    badge.style.display='block';
+  } else if(id==='new'){
+    const d=new Date(); badge.textContent=d.getDate()+' '+d.toLocaleString('en-US',{month:'short'}).toUpperCase();
+    badge.style.display='block';
+  } else {
+    badge.textContent=''; badge.style.display='none';
+  }
+}
+
+function updateMonthlyBadge(){
+  const badge=document.getElementById('tb-badge');
+  if(!badge||currentViewYear===undefined) return;
+  if(currentLang==='th'){
+    badge.textContent = MONTH_SHORT_TH[currentViewMonth]+' '+(currentViewYear+543);
+  } else {
+    badge.textContent = MONTH_NAMES[currentViewMonth].slice(0,3).toUpperCase()+' '+currentViewYear;
+  }
+}
+
+// ── RISK CALC ──
+
+
+
+// ── FORM ──
+function selectBS(d){formState.direction=d;document.getElementById('btn-buy').classList.toggle('active',d==='BUY');document.getElementById('btn-sell').classList.toggle('active',d==='SELL');autoCalcTPSL();}
+function selectResult(r){formState.result=r;['win','loss','be'].forEach(x=>document.getElementById('res-'+x).classList.remove('active'));document.getElementById('res-'+r.toLowerCase()).classList.add('active')}
+function setStar(n){formState.stars=n;document.querySelectorAll('#star-row .star').forEach((s,i)=>s.classList.toggle('lit',i<n))}
+function makeChipGroup(gid,key){
+  document.querySelectorAll(`#${gid} .sch`).forEach(c=>{
+    c.addEventListener('click',function(){
+      document.querySelectorAll(`#${gid} .sch`).forEach(x=>x.classList.remove('sel'));
+      this.classList.add('sel');
+      formState[key]=this.dataset.val;
+    });
+  });
+}
+function calcRR(){
+  const e=parseFloat(document.getElementById('f-entry').value);
+  const sl=parseFloat(document.getElementById('f-sl').value);
+  const tp=parseFloat(document.getElementById('f-tp').value);
+  const lot=parseFloat(document.getElementById('f-lot').value)||0;
+  const pipp=10;
+  if(e&&sl&&tp){
+    const slP=Math.abs(e-sl),tpP=Math.abs(tp-e);
+    document.getElementById('ac-rr').textContent=(tpP/slP).toFixed(2);
+    document.getElementById('ac-pips').textContent=slP.toFixed(1);
+    document.getElementById('ac-pl').textContent=lot?'$'+( tpP*lot*pipp).toFixed(0):'—';
+  } else {
+    document.getElementById('ac-rr').textContent='—';
+    document.getElementById('ac-pips').textContent='—';
+    document.getElementById('ac-pl').textContent='—';
+  }
+}
+function handleImg(input){
+  const file=input.files[0];if(!file)return;
+  if(file.size>3*1024*1024){showToast('⚠️ รูปใหญ่เกิน 3MB');return;}
+  const r=new FileReader();
+  r.onload=e=>{formState.imgData=e.target.result;document.getElementById('img-preview').src=e.target.result;document.getElementById('img-preview-wrap').style.display='block';document.querySelector('#img-upload-wrap .img-upload-btn').style.display='none'};
+  r.readAsDataURL(file);
+}
+function clearImg(){formState.imgData='';document.getElementById('f-img').value='';document.getElementById('img-preview-wrap').style.display='none';document.querySelector('#img-upload-wrap .img-upload-btn').style.display='flex'}
+function resetForm(){
+  formState={direction:'BUY',result:'WIN',ms:'',tech:'',stars:3,imgData:''};
+  selectBS('BUY');selectResult('WIN');setStar(3);
+  ['f-entry','f-sl','f-tp','f-lot','f-profit','f-note','f-sl-dist','f-tp-dist'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+  const slp=document.getElementById('f-sl-price');if(slp)slp.textContent='—';
+  const tpp=document.getElementById('f-tp-price');if(tpp)tpp.textContent='—';
+  document.getElementById('f-date').value=new Date().toISOString().slice(0,10);
+  document.querySelectorAll('#ms-group .sch,#tech-group .sch').forEach(c=>c.classList.remove('sel'));
+  clearImg();calcRR();
+  document.getElementById('screen-new').scrollTop=0;
+}
+
+
+// ── AUTO TP/SL PRICE CALC ──
+function autoCalcTPSL() {
+  const entry = parseFloat(document.getElementById('f-entry').value);
+  const slDist = parseFloat(document.getElementById('f-sl-dist').value);
+  const tpDist = parseFloat(document.getElementById('f-tp-dist').value);
+  const dir = formState.direction; // BUY or SELL
+
+  if (entry && slDist) {
+    const slPrice = dir === 'BUY' ? entry - slDist : entry + slDist;
+    document.getElementById('f-sl').value = slPrice.toFixed(2);
+    document.getElementById('f-sl-price').textContent = slPrice.toFixed(1);
+  } else {
+    document.getElementById('f-sl').value = '';
+    document.getElementById('f-sl-price').textContent = '—';
+  }
+  if (entry && tpDist) {
+    const tpPrice = dir === 'BUY' ? entry + tpDist : entry - tpDist;
+    document.getElementById('f-tp').value = tpPrice.toFixed(2);
+    document.getElementById('f-tp-price').textContent = tpPrice.toFixed(1);
+  } else {
+    document.getElementById('f-tp').value = '';
+    document.getElementById('f-tp-price').textContent = '—';
+  }
+}
+
+// ── SAVE ──
+function saveTrade(){
+  const entry=parseFloat(document.getElementById('f-entry').value);
+  const sl=parseFloat(document.getElementById('f-sl').value);
+  if(!entry||!sl||!document.getElementById('f-date').value){showToast('⚠️ กรุณากรอก Date, Entry, SL');return;}
+  const tp=parseFloat(document.getElementById('f-tp').value);
+  const lot=parseFloat(document.getElementById('f-lot').value);
+  const pipp=10;
+  const rr=(entry&&sl&&tp)?parseFloat((Math.abs(tp-entry)/Math.abs(entry-sl)).toFixed(2)):null;
+  let profit=parseFloat(document.getElementById('f-profit').value);
+  if(isNaN(profit)&&rr&&lot){
+    const slP=Math.abs(entry-sl),tpP=Math.abs(tp-entry);
+    if(formState.result==='WIN')profit=parseFloat((tpP*lot*pipp).toFixed(2));
+    else if(formState.result==='LOSS')profit=parseFloat((-slP*lot*pipp).toFixed(2));
+    else profit=0;
+  }
+  const trade={id:Date.now(),date:document.getElementById('f-date').value,session:document.getElementById('f-session').value,ms:formState.ms,tech:formState.tech,direction:formState.direction,tf:document.getElementById('f-tf').value,lot:lot||null,entry,sl,tp:tp||null,result:formState.result,profit:isNaN(profit)?0:profit,rr,stars:formState.stars,note:document.getElementById('f-note').value,img:formState.imgData};
+  showToast('⏳ กำลังบันทึก...');
+  window.dbSaveTrade(trade).then(()=>{
+    window._trades=[trade,...window._trades.filter(t=>t.id!==trade.id)];
+    window._trades.sort((a,b)=>b.date!==a.date?b.date.localeCompare(a.date):b.id-a.id);
+    showToast('✅ บันทึกแล้ว!');
+    goScreen('log',document.querySelector('[data-screen="log"]'));
+  }).catch(e=>{showToast('❌ '+(e.message||'บันทึกไม่สำเร็จ'));console.error(e);});
+}
+
+// ── RENDER DASHBOARD ──
+function renderDash(){
+  const tr=window.trades;
+  const wins=tr.filter(t=>t.result==='WIN');
+  const losses=tr.filter(t=>t.result==='LOSS');
+  const bes=tr.filter(t=>t.result==='BE');
+  const pnl=tr.reduce((s,t)=>s+(t.profit||0),0);
+  const wr=tr.length?(wins.length/tr.length*100):0;
+  const rrs=tr.filter(t=>t.rr).map(t=>t.rr);
+  const avgRR=rrs.length?(rrs.reduce((a,b)=>a+b,0)/rrs.length):null;
+  const gw=wins.reduce((s,t)=>s+(t.profit||0),0);
+  const gl=Math.abs(losses.reduce((s,t)=>s+(t.profit||0),0));
+  const pf=gl?gw/gl:null;
+  const profits=tr.map(t=>t.profit||0);
+  const best=profits.length?Math.max(...profits):null;
+  const worst=profits.length?Math.min(...profits):null;
+
+  // WR Hero
+  const wrEl=document.getElementById('wr-num');
+  wrEl.textContent=wr.toFixed(1)+'%';
+  wrEl.className='wr-hero-num '+(wr>=60?'hi':wr>=50?'mid':'lo');
+  document.getElementById('wr-fill').style.width=wr+'%';
+  const pnlEl=document.getElementById('wr-pnl');
+  pnlEl.textContent=(pnl>=0?'+':'')+'$'+Math.abs(pnl).toFixed(2);
+  pnlEl.className='wr-hero-pnl '+(pnl>=0?'pos':'neg');
+  document.getElementById('wr-trades').textContent=tr.length+' '+t('trades');
+  document.getElementById('ws-w').textContent=wins.length;
+  document.getElementById('ws-l').textContent=losses.length;
+  document.getElementById('ws-b').textContent=bes.length;
+  document.getElementById('ws-rr').textContent=avgRR?avgRR.toFixed(2):'—';
+  document.getElementById('ws-pf').textContent=pf?pf.toFixed(2):'—';
+
+  // Streak
+  let streak=0,streakLabel='—';
+  if(tr.length){const last=tr[0].result;for(let t of tr){if(t.result===last)streak++;else break;}const ic=last==='WIN'?'🔥':last==='LOSS'?'📉':'➖';const lastLabel=last==='WIN'?(currentLang==='en'?'WIN':'ชนะ'):last==='LOSS'?(currentLang==='en'?'LOSS':'แพ้'):'BE';streakLabel=`${lastLabel} ×${streak} ${ic}`;}
+  document.getElementById('wr-streak').textContent=streakLabel;
+
+  // Loss warning — use real settings
+  const warn=document.getElementById('loss-warn-wrap');
+  const todayTrades=tr.filter(t=>t.date===new Date().toISOString().slice(0,10));
+  const todayLoss=todayTrades.reduce((s,t)=>s+(t.profit||0),0);
+  const limit=settingsState?.lossLimit||300;
+  if(todayLoss<=-limit){
+    warn.innerHTML=`<div class="loss-warn"><div class="loss-warn-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div><div class="loss-warn-text">${t('lossWarnDay')} $${Math.abs(todayLoss).toFixed(0)} ${t('lossWarnLimit')} $${limit}<br>${t('lossWarnStop')}</div></div>`;
+  } else if(streak>=3&&tr[0]?.result==='LOSS'){
+    warn.innerHTML=`<div class="loss-warn"><div class="loss-warn-icon"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div><div class="loss-warn-text">${t('lossWarnStreak')} ${streak} ${t('lossWarnStreakSuf')}</div></div>`;
+  } else warn.innerHTML='';
+
+  // KPIs
+  const pnlKpi=document.getElementById('kpi-pnl');
+  pnlKpi.textContent=(pnl>=0?'+':'')+'$'+Math.abs(pnl).toFixed(2);
+  pnlKpi.className='kpi-val '+(pnl>=0?'pos':'neg');
+  document.getElementById('kpi-pnl-sub').textContent=tr.length+' '+t('kpiTrades');
+  document.getElementById('kpi-best').textContent=best!==null?'$'+best.toFixed(0):'—';
+  document.getElementById('kpi-worst-sub').textContent=worst!==null?t('worst')+(worst>=0?'$'+worst.toFixed(0):'-$'+Math.abs(worst).toFixed(0)):t('worst')+'—';
+  document.getElementById('kpi-rr').textContent=avgRR?avgRR.toFixed(2):'—';
+  document.getElementById('kpi-pf').textContent=pf?pf.toFixed(2):'—';
+  document.getElementById('kpi-streak-sub').textContent=streakLabel;
+
+  drawEquity();
+  renderBarChart('sess-chart',['London AM (05-13)','London PM (13-18)','NY Open (19-23)','NY Late (23-04)'],['London AM','London PM','NY Open','NY Late'],t=>t.session);
+  renderBarChart('tech-chart',['ในกรอบ','ไม้รวย','แนวเด้ง','ตามแรง','ตามเจ้า','ปลายไส้'],null,t=>t.tech);
+  renderBarChart('ms-chart',['เทรนขึ้น','เทรนลง','SW ยกขึ้น','SW กดลง','ภูเขาโซนล่าง','ภูเขาโซนบน','ไม่ชัด'],null,t=>t.ms);
+  updateTopbar('dash');
+}
+
+function drawEquity(){
+  const canvas=document.getElementById('eq-canvas');
+  const ctx=canvas.getContext('2d');
+  const dpr=window.devicePixelRatio||1;
+  const W=canvas.parentElement.getBoundingClientRect().width,H=80;
+  canvas.width=W*dpr;canvas.height=H*dpr;ctx.scale(dpr,dpr);
+  ctx.clearRect(0,0,W,H);
+  const sorted=[...window.trades].sort((a,b)=>a.date.localeCompare(b.date));
+  if(sorted.length<2){ctx.fillStyle='#4A5C70';ctx.font='12px Syne';ctx.textAlign='center';ctx.fillText('ยังไม่มีข้อมูลเพียงพอ',W/2,H/2);return;}
+  let cum=0;const pts=[0,...sorted.map(t=>{cum+=(t.profit||0);return cum;})];
+  const minP=Math.min(...pts),maxP=Math.max(...pts),range=maxP-minP||1,pad=8;
+  const toX=i=>(i/(pts.length-1))*(W-pad*2)+pad;
+  const toY=v=>H-pad-((v-minP)/range)*(H-pad*2);
+  const isPos=pts[pts.length-1]>=0;
+  const grad=ctx.createLinearGradient(0,0,0,H);
+  grad.addColorStop(0,isPos?'rgba(0,229,160,0.25)':'rgba(255,77,109,0.25)');
+  grad.addColorStop(1,'rgba(0,0,0,0)');
+  ctx.beginPath();ctx.moveTo(toX(0),toY(pts[0]));pts.forEach((p,i)=>ctx.lineTo(toX(i),toY(p)));
+  ctx.lineTo(toX(pts.length-1),H);ctx.lineTo(toX(0),H);ctx.closePath();
+  ctx.fillStyle=grad;ctx.fill();
+  ctx.beginPath();ctx.moveTo(toX(0),toY(pts[0]));pts.forEach((p,i)=>ctx.lineTo(toX(i),toY(p)));
+  ctx.strokeStyle=isPos?'#00E5A0':'#FF4D6D';ctx.lineWidth=2;ctx.lineJoin='round';ctx.stroke();
+  if(minP<0&&maxP>0){const zY=toY(0);ctx.beginPath();ctx.moveTo(0,zY);ctx.lineTo(W,zY);ctx.strokeStyle='rgba(255,255,255,0.08)';ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.stroke();ctx.setLineDash([]);}
+}
+
+function renderBarChart(elId,vals,labels,getter){
+  let html='';
+  vals.forEach((v,i)=>{
+    const st=window.trades.filter(t=>getter(t)===v);
+    if(!st.length)return;
+    const w=st.filter(t=>t.result==='WIN').length;
+    const pct=Math.round(w/st.length*100);
+    const color=pct>=60?'var(--em)':pct>=45?'var(--em)':'var(--rose)';
+    const label=labels?labels[i]:v;
+    html+=`<div class="bar-row"><div class="bar-name">${label}</div><div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${color}"></div></div><div class="bar-pct">${pct}%</div><div class="bar-cnt">${st.length}T</div></div>`;
+  });
+  document.getElementById(elId).innerHTML=html||'<div style="color:var(--t3);font-size:12px;text-align:center;padding:8px">ยังไม่มีข้อมูล</div>';
+}
+
+// ── RENDER LOG ──
+function renderLog(){
+  let filtered=window.trades;
+  if(currentFilter!=='all'){
+    if(['WIN','LOSS','BE'].includes(currentFilter))filtered=window.trades.filter(t=>t.result===currentFilter);
+    if(['BUY','SELL'].includes(currentFilter))filtered=window.trades.filter(t=>t.direction===currentFilter);
+  }
+  if(!filtered.length){
+    document.getElementById('trade-list').innerHTML=`<div class="empty"><div class="empty-icon">📭</div><div class="empty-txt">${window.trades.length?t('noFilter'):t('noTrades')}</div></div>`;
+    return;
+  }
+  let html='';
+  filtered.forEach(t=>{
+    const rc=t.result==='WIN'?'win-row':t.result==='LOSS'?'loss-row':'be-row';
+    const pc=t.result==='WIN'?'win':t.result==='LOSS'?'loss':'be';
+    const pnlTxt=t.profit>=0?`+$${t.profit.toFixed(2)}`:`-$${Math.abs(t.profit).toFixed(2)}`;
+    const stars=t.stars?'★'.repeat(t.stars)+'☆'.repeat(5-t.stars):'—';
+    const dateStr=t.date?new Date(t.date+'T12:00:00').toLocaleDateString(currentLang==='en'?'en-US':'th-TH',{day:'numeric',month:'short'}):'';
+    html+=`<div class="trade-card ${rc}" onclick="openDetail(${t.id})">
+      <div class="t-top">
+        <div><div class="t-chips">
+          <span class="chip ${t.direction.toLowerCase()}">${t.direction}</span>
+          ${t.session?`<span class="chip sess">${t.session.split(' (')[0]}</span>`:''}
+          ${t.tech?`<span class="chip tech">${t.tech}</span>`:''}
+          ${t.tf?`<span class="chip tf">${t.tf}</span>`:''}
+        </div><div style="font-size:10px;color:var(--t3);margin-top:5px;font-weight:600">${dateStr}</div></div>
+        <div class="t-right"><div class="t-pnl ${pc}">${pnlTxt}</div><div class="t-badge ${pc}">${t.result}</div></div>
+      </div>
+      <div class="t-details">
+        <div class="t-det"><div class="t-det-label">${t2('entryPrice')}</div><div class="t-det-val">${t.entry||'—'}</div></div>
+        <div class="t-det"><div class="t-det-label">Lot</div><div class="t-det-val">${t.lot||'—'}</div></div>
+        <div class="t-det"><div class="t-det-label">RR</div><div class="t-det-val">${t.rr||'—'}</div></div>
+        <div class="t-det"><div class="t-det-label">${t2('setupQuality')}</div><div class="t-det-val"><span class="stars">${stars.slice(0,5)}</span></div></div>
+      </div>
+    </div>`;
+  });
+  document.getElementById('trade-list').innerHTML=html;
+  updateTopbar('log');
+}
+
+// ── DETAIL MODAL ──
+function openDetail(id){
+  const t=window.trades.find(x=>x.id===id);if(!t)return;
+  currentDetailId=id;
+  document.getElementById('det-edit-btn').onclick=()=>{closeModal();openEdit(id);};
+  const pc=t.result==='WIN'?'win':t.result==='LOSS'?'loss':'be';
+  const pnlTxt=t.profit>=0?`+$${t.profit.toFixed(2)}`:`-$${Math.abs(t.profit).toFixed(2)}`;
+  const stars=t.stars?'★'.repeat(t.stars)+'☆'.repeat(5-t.stars):'—';
+  const dateStr=t.date?new Date(t.date+'T12:00:00').toLocaleDateString(currentLang==='en'?'en-US':'th-TH',{weekday:'long',year:'numeric',month:'long',day:'numeric'}):'';
+  let html=`<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+    <div class="t-chips"><span class="chip ${t.direction.toLowerCase()}">${t.direction}</span><span class="t-badge ${pc}">${t.result}</span></div>
+    <div class="t-pnl ${pc}" style="font-size:22px">${pnlTxt}</div>
+  </div>
+  <div style="font-size:11px;color:var(--t3);margin-bottom:14px;font-weight:600">${dateStr}</div>
+  <div class="det-row">
+    ${dc(t2('session'),t.session?t.session.split(' (')[0]:'—')}${dc('TF',t.tf||'—')}${dc('Lot',t.lot||'—')}
+    ${dc(t2('entryPrice'),t.entry||'—')}${dc('SL',t.sl||'—')}${dc('TP',t.tp||'—')}
+    ${dc('RR',t.rr||'—')}${dc(t2('technique'),t.tech||'—')}${dc(t2('ms'),t.ms||'—')}
+  </div>
+  <div class="det-row">${dc(t2('setupQuality'),`<span class="stars">${stars}</span>`,'span2')}${dc(t2('actualPnl'),pnlTxt)}</div>`;
+  if(t.note)html+=`<div style="background:var(--s2);border-radius:var(--r1);padding:12px;margin-bottom:12px;font-size:13px;color:var(--t2);line-height:1.6;border:1px solid var(--bdr)"><div style="font-size:9px;color:var(--t3);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">Note</div>${t.note}</div>`;
+  if(t.img)html+=`<img src="${t.img}" style="width:100%;border-radius:var(--r1);margin-bottom:12px;display:block;max-height:240px;object-fit:cover" onclick="this.style.maxHeight=this.style.maxHeight==='none'?'240px':'none'">`;
+  html+=`<button class="del-btn" onclick="deleteTrade(${id})">${t('deleteBtn')}</button>`;
+  document.getElementById('modal-content').innerHTML=html;
+  document.getElementById('detail-modal').classList.add('open');
+}
+function dc(label,val,cls=''){return `<div class="det-cell ${cls}"><div class="det-lbl">${label}</div><div class="det-val">${val}</div></div>`;}
+function closeModal(){document.getElementById('detail-modal').classList.remove('open');}
+function deleteTrade(id){
+  if(!confirm('ลบ trade นี้?'))return;
+  closeModal();
+  window._trades=window._trades.filter(t=>t.id!==id);
+  renderLog();
+  window.dbDeleteTrade(id).then(()=>showToast('🗑 ลบแล้ว')).catch(e=>{showToast('❌ ลบไม่สำเร็จ');console.error(e);});
+}
+
+// ── EDIT ──
+function openEdit(id){
+  const t=window.trades.find(x=>x.id===id);if(!t)return;
+  editState={id:t.id,direction:t.direction||'BUY',result:t.result||'WIN',ms:t.ms||'',tech:t.tech||'',stars:t.stars||3,imgData:t.img||''};
+  editSelectBS(editState.direction);editSelectResult(editState.result);setEditStar(editState.stars);
+  document.getElementById('e-date').value=t.date||'';
+  Array.from(document.getElementById('e-tf').options).forEach(o=>o.selected=o.value===t.tf);
+  Array.from(document.getElementById('e-session').options).forEach(o=>o.selected=o.value===t.session);
+  document.querySelectorAll('#e-ms-group .sch').forEach(c=>c.classList.toggle('sel',c.dataset.val===t.ms));
+  document.querySelectorAll('#e-tech-group .sch').forEach(c=>c.classList.toggle('sel',c.dataset.val===t.tech));
+  document.getElementById('e-entry').value=t.entry||'';document.getElementById('e-sl').value=t.sl||'';
+  document.getElementById('e-tp').value=t.tp||'';document.getElementById('e-lot').value=t.lot||'';
+  document.getElementById('e-profit').value=t.profit||'';document.getElementById('e-note').value=t.note||'';
+  if(t.img){document.getElementById('e-img-preview').src=t.img;document.getElementById('e-img-preview-wrap').style.display='block';document.getElementById('e-img-upload-btn').style.display='none';}
+  else{document.getElementById('e-img-preview-wrap').style.display='none';document.getElementById('e-img-upload-btn').style.display='flex';}
+  document.getElementById('edit-modal').classList.add('open');
+  document.getElementById('edit-modal').querySelector('.modal').scrollTop=0;
+}
+function closeEditModal(){document.getElementById('edit-modal').classList.remove('open');}
+function editSelectBS(d){editState.direction=d;document.getElementById('e-btn-buy').classList.toggle('active',d==='BUY');document.getElementById('e-btn-sell').classList.toggle('active',d==='SELL');}
+function editSelectResult(r){editState.result=r;['win','loss','be'].forEach(x=>document.getElementById('e-res-'+x).classList.remove('active'));document.getElementById('e-res-'+r.toLowerCase()).classList.add('active');}
+function setEditStar(n){editState.stars=n;document.querySelectorAll('#e-star-row .star').forEach((s,i)=>s.classList.toggle('lit',i<n));}
+function handleEditImg(input){const file=input.files[0];if(!file)return;const r=new FileReader();r.onload=e=>{editState.imgData=e.target.result;document.getElementById('e-img-preview').src=e.target.result;document.getElementById('e-img-preview-wrap').style.display='block';document.getElementById('e-img-upload-btn').style.display='none';};r.readAsDataURL(file);}
+function clearEditImg(){editState.imgData='';document.getElementById('e-img-input').value='';document.getElementById('e-img-preview-wrap').style.display='none';document.getElementById('e-img-upload-btn').style.display='flex';}
+function saveEdit(){
+  const idx=window._trades.findIndex(x=>x.id===editState.id);if(idx===-1)return;
+  const t={...window._trades[idx]};
+  t.direction=editState.direction;t.date=document.getElementById('e-date').value;
+  t.tf=document.getElementById('e-tf').value;t.session=document.getElementById('e-session').value;
+  const msSel=document.querySelector('#e-ms-group .sch.sel');if(msSel)t.ms=msSel.dataset.val;
+  const techSel=document.querySelector('#e-tech-group .sch.sel');if(techSel)t.tech=techSel.dataset.val;
+  t.entry=parseFloat(document.getElementById('e-entry').value)||t.entry;
+  t.sl=parseFloat(document.getElementById('e-sl').value)||t.sl;
+  t.tp=parseFloat(document.getElementById('e-tp').value)||t.tp;
+  t.lot=parseFloat(document.getElementById('e-lot').value)||t.lot;
+  t.profit=parseFloat(document.getElementById('e-profit').value);if(isNaN(t.profit))t.profit=0;
+  t.result=editState.result;t.stars=editState.stars;t.note=document.getElementById('e-note').value;
+  if(editState.imgData)t.img=editState.imgData;
+  if(t.entry&&t.sl&&t.tp)t.rr=parseFloat((Math.abs(t.tp-t.entry)/Math.abs(t.entry-t.sl)).toFixed(2));
+  window._trades[idx]=t;closeEditModal();renderLog();
+  window.dbSaveTrade(t).then(()=>showToast('✅ แก้ไขแล้ว!')).catch(e=>{showToast('❌ บันทึกไม่สำเร็จ');console.error(e);});
+}
+function deleteFromEdit(){
+  if(!confirm('ลบ trade นี้?'))return;
+  const delId=editState.id;
+  window._trades=window._trades.filter(x=>x.id!==delId);
+  closeEditModal();renderLog();
+  window.dbDeleteTrade(delId).then(()=>showToast('🗑 ลบแล้ว')).catch(e=>{showToast('❌ ลบไม่สำเร็จ');console.error(e);});
+}
+document.querySelectorAll('#e-ms-group .sch').forEach(c=>{c.addEventListener('click',function(){document.querySelectorAll('#e-ms-group .sch').forEach(x=>x.classList.remove('sel'));this.classList.add('sel');editState.ms=this.dataset.val;});});
+document.querySelectorAll('#e-tech-group .sch').forEach(c=>{c.addEventListener('click',function(){document.querySelectorAll('#e-tech-group .sch').forEach(x=>x.classList.remove('sel'));this.classList.add('sel');editState.tech=this.dataset.val;});});
+
+// ── MONTHLY ──
+function initMonth(){const n=new Date();currentViewYear=n.getFullYear();currentViewMonth=n.getMonth();}
+
+// ── MONTHLY VIEW STATE ──
+let currentMonthlyView = 'monthly'; // 'monthly' | 'weekly' | 'daily'
+let currentWeekOffset = 0; // weeks from today's week
+let currentDayOffset = 0;  // days from today
+
+function switchMonthlyView(v) {
+  currentMonthlyView = v;
+  ['monthly','weekly','daily'].forEach(x => {
+    document.getElementById('mv-'+x).style.display = x===v ? 'block' : 'none';
+    document.getElementById('mv-tab-'+x).classList.toggle('active', x===v);
+  });
+  renderMonthly();
+}
+
+// Date picker change handlers
+function onMonthPickerChange(val) {
+  if(!val) return;
+  const parts = val.split('-'); const y=parseInt(parts[0]); const m=parseInt(parts[1]);
+  currentViewYear = y; currentViewMonth = m-1;
+  renderMonthly();
+}
+function onWeekPickerChange(val) {
+  if(!val) return;
+  const parts = val.split('-W'); const yr=parseInt(parts[0]); const wk=parseInt(parts[1]);
+  const now = new Date();
+  const dayOfWeek = now.getDay() || 7;
+  const curMon = new Date(now); curMon.setDate(now.getDate() - dayOfWeek + 1); curMon.setHours(0,0,0,0);
+  const jan4 = new Date(yr, 0, 4);
+  const selMon = new Date(jan4);
+  selMon.setDate(jan4.getDate() - ((jan4.getDay()||7)-1) + (wk-1)*7);
+  currentWeekOffset = Math.round((selMon - curMon) / (7*24*3600*1000));
+  renderMonthly();
+}
+function onDayPickerChange(val) {
+  if(!val) return;
+  const sel = new Date(val+'T12:00:00');
+  const today = new Date(); today.setHours(0,0,0,0);
+  currentDayOffset = Math.round((sel - today) / (24*3600*1000));
+  renderMonthly();
+}
+function getISOWeekString(date) {
+  const d = new Date(date); d.setHours(12,0,0,0);
+  d.setDate(d.getDate() + 4 - (d.getDay()||7));
+  const yearStart = new Date(d.getFullYear(),0,1);
+  const wk = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
+  return `${d.getFullYear()}-W${String(wk).padStart(2,'0')}`;
+}
+function syncPickers() {
+  updateDpTriggerLabel();
+}
+
+// ── CUSTOM DATE PICKER ──
+let _dpOpen = false;
+// Internal state for the popup
+let _dpYear, _dpMonth; // used when browsing inside popup
+
+const MONTH_NAMES    = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const MONTH_NAMES_TH = ['มกราคม','กุมภาพันธ์','มีนาคม','เมษายน','พฤษภาคม','มิถุนายน','กรกฎาคม','สิงหาคม','กันยายน','ตุลาคม','พฤศจิกายน','ธันวาคม'];
+const MONTH_SHORT_TH = ['ม.ค.','ก.พ.','มี.ค.','เม.ย.','พ.ค.','มิ.ย.','ก.ค.','ส.ค.','ก.ย.','ต.ค.','พ.ย.','ธ.ค.'];
+const DAY_ABBRS      = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+const DAY_ABBRS_TH   = ['อา','จ','อ','พ','พฤ','ศ','ส'];
+const DAY_SHORT_EN   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+const DAY_SHORT_TH   = ['อา.','จ.','อ.','พ.','พฤ.','ศ.','ส.'];
+
+function dpMonthName(mi) { return currentLang==='th' ? MONTH_NAMES_TH[mi] : MONTH_NAMES[mi]; }
+function dpMonthShort(mi) { return currentLang==='th' ? MONTH_SHORT_TH[mi] : MONTH_NAMES[mi].slice(0,3); }
+function dpDayAbbrs() { return currentLang==='th' ? DAY_ABBRS_TH : DAY_ABBRS; }
+// Buddhist Era year for Thai
+function dpYear(y) { return currentLang==='th' ? (y+543) : y; }
+
+function updateDpTriggerLabel() {
+  const el = document.getElementById('dp-trigger-text');
+  if (!el) return;
+  const v = currentMonthlyView;
+  if (v === 'monthly') {
+    const y = currentViewYear, m = currentViewMonth;
+    el.textContent = `${dpMonthName(m)} ${dpYear(y)}`;
+  } else if (v === 'weekly') {
+    const dates = getWeekDates(currentWeekOffset);
+    const mon = dates[0], sun = dates[6];
+    const fmt = d => `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}`;
+    el.textContent = `${fmt(mon)} – ${fmt(sun)} ${dpYear(sun.getFullYear())}`;
+  } else {
+    const d = new Date(); d.setDate(d.getDate() + currentDayOffset);
+    const ds = currentLang==='th' ? DAY_SHORT_TH : DAY_SHORT_EN;
+    el.textContent = `${ds[d.getDay()]} ${d.getDate()} ${dpMonthShort(d.getMonth())} ${dpYear(d.getFullYear())}`;
+  }
+}
+
+function openDatePicker() {
+  _dpOpen = true;
+  const v = currentMonthlyView;
+  // Set internal browse state
+  if (v === 'monthly') {
+    _dpYear = currentViewYear; _dpMonth = currentViewMonth;
+  } else if (v === 'weekly' || v === 'daily') {
+    const d = new Date(); d.setDate(d.getDate() + (v==='weekly' ? currentWeekOffset*7 : currentDayOffset));
+    _dpYear = d.getFullYear(); _dpMonth = d.getMonth();
+  }
+  // Position popup just below the trigger button
+  const trigger = document.getElementById('dp-trigger');
+  const popup   = document.getElementById('dp-popup');
+  const overlay = document.getElementById('dp-overlay');
+  const rect = trigger.getBoundingClientRect();
+  const topPos = Math.min(rect.bottom + 8, window.innerHeight - 380);
+  popup.style.top = topPos + 'px';
+  popup.style.display = 'block';
+  overlay.style.display = 'block';
+  renderDpPopup();
+}
+
+function closeDatePicker() {
+  document.getElementById('dp-popup').style.display = 'none';
+  document.getElementById('dp-overlay').style.display = 'none';
+  _dpOpen = false;
+}
+
+function dpNavPrev() {
+  const v = currentMonthlyView;
+  if (v === 'monthly') {
+    _dpYear--; // go back a year in month-grid view
+  } else {
+    _dpMonth--;
+    if (_dpMonth < 0) { _dpMonth = 11; _dpYear--; }
+  }
+  renderDpPopup();
+}
+function dpNavNext() {
+  const v = currentMonthlyView;
+  if (v === 'monthly') {
+    _dpYear++;
+  } else {
+    _dpMonth++;
+    if (_dpMonth > 11) { _dpMonth = 0; _dpYear++; }
+  }
+  renderDpPopup();
+}
+
+function renderDpPopup() {
+  const v = currentMonthlyView;
+  const title = document.getElementById('dp-header-title');
+  const dayHeaders = document.getElementById('dp-day-headers');
+  const dayGrid = document.getElementById('dp-day-grid');
+  const monthGrid = document.getElementById('dp-month-grid');
+
+  if (v === 'monthly') {
+    // Show month grid for the current _dpYear
+    title.textContent = String(dpYear(_dpYear));
+    dayHeaders.style.display = 'none';
+    dayGrid.style.display = 'none';
+    monthGrid.style.display = 'grid';
+    monthGrid.innerHTML = '';
+    MONTH_NAMES.forEach((name, mi) => {
+      const isSelected = (_dpYear === currentViewYear && mi === currentViewMonth);
+      const isNow = (new Date().getFullYear() === _dpYear && new Date().getMonth() === mi);
+      const btn = document.createElement('button');
+      btn.textContent = dpMonthShort(mi);
+      btn.style.cssText = `padding:10px 4px;border-radius:10px;font-size:13px;font-weight:700;cursor:pointer;
+        font-family:'Inter',sans-serif;border:1.5px solid ${isSelected ? 'var(--em)' : 'transparent'};
+        background:${isSelected ? 'var(--em)' : isNow ? 'var(--s3)' : 'var(--s2)'};
+        color:${isSelected ? '#fff' : isNow ? 'var(--em)' : 'var(--t1)'};
+        transition:all .12s`;
+      btn.onclick = () => {
+        currentViewYear = _dpYear; currentViewMonth = mi;
+        closeDatePicker(); updateDpTriggerLabel(); renderMonthly();
+      };
+      monthGrid.appendChild(btn);
+    });
+
+  } else if (v === 'daily') {
+    title.textContent = `${dpMonthName(_dpMonth)} ${dpYear(_dpYear)}`;
+    dayHeaders.style.display = 'grid';
+    dayGrid.style.display = 'grid';
+    monthGrid.style.display = 'none';
+    // Day-of-week headers
+    dayHeaders.innerHTML = dpDayAbbrs().map(d =>
+      `<div style="text-align:center;font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.04em;padding:2px 0">${d}</div>`
+    ).join('');
+    // Get selected day
+    const selDate = new Date(); selDate.setDate(selDate.getDate() + currentDayOffset);
+    const today = new Date(); today.setHours(0,0,0,0);
+    // Build day cells
+    const firstDay = new Date(_dpYear, _dpMonth, 1).getDay();
+    const daysInMonth = new Date(_dpYear, _dpMonth+1, 0).getDate();
+    dayGrid.innerHTML = '';
+    // Empty cells
+    for (let i = 0; i < firstDay; i++) {
+      dayGrid.innerHTML += `<div></div>`;
+    }
+    for (let d = 1; d <= daysInMonth; d++) {
+      const thisDate = new Date(_dpYear, _dpMonth, d);
+      thisDate.setHours(0,0,0,0);
+      const isSelected = (thisDate.getTime() === new Date(selDate.getFullYear(), selDate.getMonth(), selDate.getDate()).getTime());
+      const isToday    = (thisDate.getTime() === today.getTime());
+      const diff = Math.round((thisDate - today) / 86400000);
+      const btn = document.createElement('button');
+      btn.textContent = d;
+      btn.style.cssText = `aspect-ratio:1;border-radius:50%;font-size:13px;font-weight:${isSelected||isToday?'700':'500'};
+        cursor:pointer;font-family:'DM Mono',monospace;border:none;
+        background:${isSelected ? 'var(--em)' : isToday ? 'rgba(0,229,160,.15)' : 'transparent'};
+        color:${isSelected ? '#fff' : isToday ? 'var(--em)' : 'var(--t1)'};
+        transition:background .1s;width:100%`;
+      btn.onclick = () => {
+        currentDayOffset = diff; closeDatePicker(); updateDpTriggerLabel(); renderMonthly();
+      };
+      dayGrid.appendChild(btn);
+    }
+
+  } else if (v === 'weekly') {
+    title.textContent = `${dpMonthName(_dpMonth)} ${dpYear(_dpYear)}`;
+    dayHeaders.style.display = 'grid';
+    dayGrid.style.display = 'grid';
+    monthGrid.style.display = 'none';
+    // Day-of-week headers
+    dayHeaders.innerHTML = dpDayAbbrs().map(d =>
+      `<div style="text-align:center;font-size:10px;font-weight:700;color:var(--t3);letter-spacing:.04em;padding:2px 0">${d}</div>`
+    ).join('');
+    // Compute current selected week's Mon
+    const today = new Date(); today.setHours(0,0,0,0);
+    const todayDow = today.getDay(); // 0=Sun
+    const monOffset = todayDow === 0 ? -6 : 1 - todayDow;
+    const thisMon = new Date(today); thisMon.setDate(today.getDate() + monOffset + currentWeekOffset * 7);
+
+    const firstDay = new Date(_dpYear, _dpMonth, 1).getDay();
+    const daysInMonth = new Date(_dpYear, _dpMonth+1, 0).getDate();
+    dayGrid.innerHTML = '';
+    for (let i = 0; i < firstDay; i++) dayGrid.innerHTML += `<div></div>`;
+    for (let d = 1; d <= daysInMonth; d++) {
+      const thisDate = new Date(_dpYear, _dpMonth, d); thisDate.setHours(0,0,0,0);
+      // Determine if this date is in the selected week
+      const diffDays = Math.round((thisDate - thisMon) / 86400000);
+      const inSelWeek = (diffDays >= 0 && diffDays <= 6);
+      const isMon = (diffDays === 0);
+      const isSun = (diffDays === 6);
+      const isToday = (thisDate.getTime() === today.getTime());
+      const btn = document.createElement('button');
+      btn.textContent = d;
+      // Week offset for this cell
+      const cellDow = thisDate.getDay(); // 0=Sun
+      const cellMonOffset = cellDow === 0 ? -6 : 1 - cellDow;
+      const cellMon = new Date(thisDate); cellMon.setDate(thisDate.getDate() + cellMonOffset);
+      const weekDiff = Math.round((cellMon - new Date(today.getFullYear(), today.getMonth(), today.getDate() + monOffset)) / (7*86400000));
+      btn.style.cssText = `aspect-ratio:1;border-radius:${isMon?'50% 0 0 50%':isSun?'0 50% 50% 0':'0'};
+        font-size:13px;font-weight:${inSelWeek?'700':'500'};cursor:pointer;font-family:'DM Mono',monospace;border:none;
+        background:${inSelWeek ? (isMon||isSun ? 'var(--em)' : 'rgba(0,229,160,.18)') : 'transparent'};
+        color:${inSelWeek ? (isMon||isSun ? '#fff' : 'var(--em)') : isToday ? 'var(--em)' : 'var(--t1)'};
+        transition:background .1s;width:100%`;
+      if (isToday && !inSelWeek) btn.style.outline = '1.5px solid var(--em)';
+      btn.onclick = () => {
+        currentWeekOffset = weekDiff; closeDatePicker(); updateDpTriggerLabel(); renderMonthly();
+      };
+      dayGrid.appendChild(btn);
+    }
+  }
+}
+
+function monthlyNavPrev() {
+  if(currentMonthlyView==='monthly') { currentViewMonth--; if(currentViewMonth<0){currentViewMonth=11;currentViewYear--;} }
+  else if(currentMonthlyView==='weekly') currentWeekOffset--;
+  else if(currentMonthlyView==='daily') currentDayOffset--;
+  renderMonthly();
+}
+function monthlyNavNext() {
+  if(currentMonthlyView==='monthly') { currentViewMonth++; if(currentViewMonth>11){currentViewMonth=0;currentViewYear++;} }
+  else if(currentMonthlyView==='weekly') currentWeekOffset++;
+  else if(currentMonthlyView==='daily') currentDayOffset++;
+  renderMonthly();
+}
+function changeMonth(d){
+  currentViewMonth+=d;
+  if(currentViewMonth>11){currentViewMonth=0;currentViewYear++;}
+  if(currentViewMonth<0){currentViewMonth=11;currentViewYear--;}
+  renderMonthly();
+}
+function renderMonthly(){
+  if(currentViewYear===undefined)initMonth();
+  if(currentMonthlyView==='monthly') renderMonthlyView();
+  else if(currentMonthlyView==='weekly') renderWeeklyView();
+  else if(currentMonthlyView==='daily') renderDailyView();
+  syncPickers();
+  updateMonthlyBadge();
+}
+
+function renderMonthlyView(){
+  const y=currentViewYear,m=currentViewMonth;
+  window._vy=y;window._vm=m;
+  const mt=window.trades.filter(t=>{if(!t.date)return false;const d=new Date(t.date+'T12:00:00');return d.getFullYear()===y&&d.getMonth()===m;});
+  const wins=mt.filter(t=>t.result==='WIN'),losses=mt.filter(t=>t.result==='LOSS');
+  const pnl=mt.reduce((s,t)=>s+(t.profit||0),0);
+  const wr=mt.length?Math.round(wins.length/mt.length*100):0;
+  document.getElementById('m-pnl').textContent=(pnl>=0?'+':'')+'$'+Math.abs(pnl).toFixed(0);
+  document.getElementById('m-pnl').style.color=pnl>0?'var(--em)':pnl<0?'var(--rose)':'var(--amber)';
+  document.getElementById('m-wr').textContent=wr+'%';
+  document.getElementById('m-trades').textContent=mt.length;
+  const bw=document.getElementById('m-bw');
+  if(mt.length){
+    const bp=Math.max(...mt.map(t=>t.profit||0));
+    const wp=Math.min(...mt.map(t=>t.profit||0));
+    bw.innerHTML=`<div class="bw-card best"><div class="bw-label best">${t('bestTradeLabel')}</div><div class="bw-val best">+$${bp.toFixed(0)}</div><div class="bw-sub">${mt.find(t=>(t.profit||0)===bp)?.tech||'—'}</div></div><div class="bw-card worst"><div class="bw-label worst">${t('worstTradeLabel')}</div><div class="bw-val worst">-$${Math.abs(wp).toFixed(0)}</div><div class="bw-sub">${mt.find(t=>(t.profit||0)===wp)?.tech||'—'}</div></div>`;
+  } else bw.innerHTML='';
+  // Calendar - start Monday (1=Mon ... 0=Sun → shift)
+  const dim=new Date(y,m+1,0).getDate();
+  const today=new Date();
+  const todayStr=`${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+  const dayMap={};
+  mt.forEach(t=>{if(!dayMap[t.date])dayMap[t.date]=[];dayMap[t.date].push(t);});
+  const dayHeaders=currentLang==='en'?['Sun','Mon','Tue','Wed','Thu','Fri','Sat']:['อา','จ','อ','พ','พฤ','ศ','ส'];
+  let cal=dayHeaders.map(d=>`<div class="cal-head">${d}</div>`).join('');
+  const fdRaw=new Date(y,m,1).getDay(); // 0=Sun, Sun-start
+  const offset=fdRaw; // Sun=0, Mon=1, ... Sat=6
+  for(let i=0;i<offset;i++)cal+=`<div class="cal-day empty"></div>`;
+  for(let d=1;d<=dim;d++){
+    const ds=`${y}-${String(m+1).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const dt=dayMap[ds]||[];
+    let cls='none';
+    if(dt.length){
+      const dayPnl=dt.reduce((s,t2)=>s+(t2.profit||0),0);
+      if(dayPnl>0)cls='win';else if(dayPnl<0)cls='loss';else cls='be';
+    }
+    const isTd=ds===todayStr?' today':'';
+    cal+=`<div class="cal-day ${cls}${isTd}" ${dt.length?`onclick="showDayTrades('${ds}')" style="cursor:pointer"`:''}>${d}</div>`;
+  }
+  // No trailing empty cells needed
+  document.getElementById('cal-grid').innerHTML=cal;
+  const be=mt.filter(t=>t.result==='BE').length;
+  const gw=wins.reduce((s,t)=>s+(t.profit||0),0);
+  const gl=Math.abs(losses.reduce((s,t)=>s+(t.profit||0),0));
+  const pf=gl?(gw/gl).toFixed(2):'∞';
+  const rrs=mt.filter(t=>t.rr).map(t=>t.rr);
+  const avgRR=rrs.length?(rrs.reduce((a,b)=>a+b,0)/rrs.length).toFixed(2):'—';
+  let bd=mt.length?`<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+    ${mk('WIN',wins.length,'var(--em)')}${mk('LOSS',losses.length,'var(--rose)')}
+    ${mk('BE',be,'var(--amber)')}${mk(t2('avgRR'),avgRR,'var(--blue)')}
+    ${mk(currentLang==='en'?'Gross Win':'กำไรรวม','$'+gw.toFixed(0),'var(--em)')}${mk(currentLang==='en'?'Gross Loss':'ขาดทุนรวม','-$'+gl.toFixed(0),'var(--rose)')}
+    ${mk('Profit Factor',pf,'var(--em)')}${mk(t2('kpiTrades'),mt.length,'var(--t2)')}
+  </div>`:'<div style="color:var(--t3);font-size:13px;text-align:center;padding:12px">'+t2('noFilter')+'</div>';
+  document.getElementById('m-breakdown').innerHTML=bd;
+  document.getElementById('m-note').value=window.monthNotes[`${y}-${m}`]||'';
+}
+
+function getWeekDates(offset){
+  const now=new Date();
+  const day=now.getDay(); // 0=Sun
+  const diffToSun=day; // days since last Sunday
+  const sun=new Date(now);
+  sun.setDate(now.getDate()-diffToSun+(offset*7));
+  sun.setHours(0,0,0,0);
+  const dates=[];
+  for(let i=0;i<7;i++){const d=new Date(sun);d.setDate(sun.getDate()+i);dates.push(d);}
+  return dates;
+}
+function dateStr(d){return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;}
+
+function renderWeeklyView(){
+  const dates=getWeekDates(currentWeekOffset);
+  const prevDates=getWeekDates(currentWeekOffset-1);
+  const mon=dates[0],sun=dates[6];
+  // This week trades
+  const wt=window.trades.filter(t=>{
+    if(!t.date)return false;
+    return t.date>=dateStr(mon)&&t.date<=dateStr(sun);
+  });
+  const pw=window.trades.filter(t=>{
+    if(!t.date)return false;
+    const pd0=dateStr(prevDates[0]),pd6=dateStr(prevDates[6]);
+    return t.date>=pd0&&t.date<=pd6;
+  });
+  const pnl=wt.reduce((s,t)=>s+(t.profit||0),0);
+  const prevPnl=pw.reduce((s,t)=>s+(t.profit||0),0);
+  const wr=wt.length?Math.round(wt.filter(t=>t.result==='WIN').length/wt.length*100):0;
+  const prevWr=pw.length?Math.round(pw.filter(t=>t.result==='WIN').length/pw.length*100):0;
+  const growth=prevPnl!==0?((pnl-prevPnl)/Math.abs(prevPnl)*100):0;
+  // KPIs
+  const pnlEl=document.getElementById('wk-pnl');
+  pnlEl.textContent=(pnl>=0?'+':'')+`$${Math.abs(pnl).toFixed(0)}`;
+  pnlEl.style.color=pnl>=0?'var(--em)':'var(--rose)';
+  const gb=document.getElementById('wk-growth-badge');
+  if(wt.length > 0 && pw.length > 0 && prevPnl!==0){
+    gb.textContent=(growth>=0?'↑':'↓')+' '+Math.abs(growth).toFixed(0)+'%';
+    gb.style.background=growth>=0?'rgba(0,229,160,.12)':'rgba(255,77,109,.12)';
+    gb.style.color=growth>=0?'var(--em)':'var(--rose)';
+  } else { gb.textContent=''; gb.style.background='transparent'; gb.style.color='var(--t3)'; }
+  const wrEl=document.getElementById('wk-wr');
+  wrEl.textContent=wr+'%';
+  wrEl.style.color=wr>=50?'var(--em)':'var(--rose)';
+  const vsWord = '';
+  const showVs = wt.length > 0 && pw.length > 0;
+  document.getElementById('wk-wr-vs').textContent=showVs?vsWord+prevWr+'%':'—';
+  const netEl=document.getElementById('wk-net');
+  netEl.textContent=(pnl>=0?'+':'')+`$${Math.abs(pnl).toFixed(0)}`;
+  netEl.style.color=pnl>=0?'var(--em)':'var(--rose)';
+  document.getElementById('wk-net-vs').textContent=showVs?vsWord+(prevPnl>=0?'+':'')+`$${Math.abs(prevPnl).toFixed(0)}`:'—';
+  document.getElementById('wk-count').textContent=wt.length;
+  document.getElementById('wk-count-vs').textContent=showVs?vsWord+pw.length+' '+(currentLang==='en'?'trades':'เทรด'):'—';
+  // Compare label
+  const wkN=Math.abs(currentWeekOffset);
+  const wkLabel=currentWeekOffset===0?(currentLang==='en'?'vs last week':'vs สัปดาห์ก่อน'):currentLang==='en'?`Week ${currentWeekOffset>0?'+':''}${currentWeekOffset}`:`สัปดาห์ที่ ${currentWeekOffset}`;
+  document.getElementById('wk-compare-label').textContent=currentLang==='en'?'Compared to previous week':'เทียบกับสัปดาห์ก่อน';
+  document.getElementById('wk-pnl-label').textContent=currentLang==='en'?'P&L':'กำไร & ขาดทุน';
+  document.getElementById('wk-wr-label').textContent=currentLang==='en'?'Win Rate':'อัตราชนะ';
+  document.getElementById('wk-net-label').textContent=currentLang==='en'?'Net P&L':'กำไร & ขาดทุน';
+  document.getElementById('wk-trades-label').textContent=currentLang==='en'?'Trades':'เทรด';
+  document.getElementById('wk-bestworst-sec').textContent=currentLang==='en'?'Best / Worst Day':'ดีที่สุด / แย่ที่สุด';
+  // Daily bars
+  const dayNames=currentLang==='en'?['Sun','Mon','Tue','Wed','Thu','Fri','Sat']:['อา','จ','อ','พ','พฤ','ศ','ส'];
+  const dayMap={};
+  wt.forEach(tr=>{if(!dayMap[tr.date])dayMap[tr.date]=[];dayMap[tr.date].push(tr);});
+  const dayPnls=dates.map(d=>{
+    const ds2=dateStr(d);
+    const dt=dayMap[ds2]||[];
+    return dt.reduce((s,tr)=>s+(tr.profit||0),0);
+  });
+  const maxAbs=Math.max(1,...dayPnls.map(p=>Math.abs(p)));
+  let barsHtml='';
+  dates.forEach((d,i)=>{
+    const p=dayPnls[i];
+    const h=Math.max(8,Math.abs(p)/maxAbs*60);
+    const col=p>0?'var(--em)':p<0?'var(--rose)':'var(--s4)';
+    const ds2=dateStr(d);
+    const trades=dayMap[ds2]||[];
+    barsHtml+=`<div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:4px;cursor:${trades.length?'pointer':'default'}" ${trades.length?`onclick="showDayTrades('${ds2}')"`:''}> 
+      <div style="font-size:9px;font-weight:600;color:${p===0?'var(--t3)':col};font-family:'DM Mono',monospace">${p===0?'—':(p>0?'+':'')+p.toFixed(0)}</div>
+      <div style="width:100%;height:${h}px;background:${col};border-radius:4px 4px 0 0;min-height:4px"></div>
+      <div style="font-size:9px;font-weight:700;color:var(--t3)">${dayNames[i]}</div>
+    </div>`;
+  });
+  document.getElementById('wk-daily-bars').innerHTML=barsHtml;
+  // Best/worst day
+  const filledDays=dates.map((d,i)=>({d,p:dayPnls[i],ds:dateStr(d)})).filter(x=>dayMap[x.ds]?.length);
+  const wkBw=document.getElementById('wk-bw');
+  if(filledDays.length){
+    const best=filledDays.reduce((a,b)=>a.p>b.p?a:b);
+    const worst=filledDays.reduce((a,b)=>a.p<b.p?a:b);
+    const fmtDay={weekday:'long'};
+    wkBw.innerHTML=`<div class="bw-card best"><div class="bw-label best">${currentLang==='en'?'Best Day':'วันที่ดีที่สุด'}</div><div class="bw-val best" style="font-size:20px">${new Date(best.ds+'T12:00:00').toLocaleDateString(loc,fmtDay)}</div><div class="bw-sub" style="color:var(--em);font-family:'DM Mono',monospace;font-size:14px;font-weight:600">+$${best.p.toFixed(0)}</div></div><div class="bw-card worst"><div class="bw-label worst">${currentLang==='en'?'Worst Day':'วันที่แย่ที่สุด'}</div><div class="bw-val worst" style="font-size:20px">${new Date(worst.ds+'T12:00:00').toLocaleDateString(loc,fmtDay)}</div><div class="bw-sub" style="color:var(--rose);font-family:'DM Mono',monospace;font-size:14px;font-weight:600">-$${Math.abs(worst.p).toFixed(0)}</div></div>`;
+  } else wkBw.innerHTML='<div style="color:var(--t3);font-size:12px;text-align:center;padding:8px;grid-column:span 2">'+(currentLang==='en'?'No trades match this filter':'ไม่มีเทรดที่ตรงกับที่เลือก')+'</div>';
+}
+
+function renderDailyView(){
+  const today=new Date();
+  today.setDate(today.getDate()+currentDayOffset);
+  const ds=dateStr(today);
+  const loc=currentLang==='en'?'en-US':'th-TH';
+  document.getElementById('month-label') && (document.getElementById('month-label').textContent=today.toLocaleDateString(loc,{weekday:'long',day:'numeric',month:'long',year:'numeric'}));
+  const dt=window.trades.filter(t=>t.date===ds);
+  const pnl=dt.reduce((s,t)=>s+(t.profit||0),0);
+  const el=document.getElementById('daily-list');
+  if(!dt.length){
+    el.innerHTML=`<div class="empty"><div class="empty-icon">📅</div><div class="empty-txt">${t2('noFilter')}</div></div>`;
+    return;
+  }
+  let html=`<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;background:var(--s2);padding:12px;border-radius:var(--r1);border:1px solid var(--bdr)">
+    <div style="font-size:12px;color:var(--t3);font-weight:700">${dt.length} ${t2('kpiTrades')}</div>
+    <div style="font-family:'DM Mono',monospace;font-size:16px;font-weight:600;color:${pnl>=0?'var(--em)':'var(--rose)'}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</div>
+  </div>`;
+  dt.forEach(tr=>{
+    const pc=tr.result==='WIN'?'win':tr.result==='LOSS'?'loss':'be';
+    const pnlTxt=tr.profit>=0?`+$${tr.profit.toFixed(2)}`:`-$${Math.abs(tr.profit).toFixed(2)}`;
+    html+=`<div class="trade-card ${pc}-row" onclick="openDetail(${tr.id})" style="margin-bottom:8px">
+      <div class="t-top">
+        <div><div class="t-chips">
+          <span class="chip ${tr.direction.toLowerCase()}">${tr.direction}</span>
+          ${tr.tech?`<span class="chip tech">${tr.tech}</span>`:''}
+          ${tr.tf?`<span class="chip tf">${tr.tf}</span>`:''}
+        </div></div>
+        <div class="t-right"><div class="t-pnl ${pc}">${pnlTxt}</div><div class="t-badge ${pc}">${tr.result}</div></div>
+      </div>
+      <div class="t-details">
+        <div class="t-det"><div class="t-det-label">${t2('entryPrice')}</div><div class="t-det-val">${tr.entry||'—'}</div></div>
+        <div class="t-det"><div class="t-det-label">RR</div><div class="t-det-val">${tr.rr||'—'}</div></div>
+        <div class="t-det"><div class="t-det-label">Lot</div><div class="t-det-val">${tr.lot||'—'}</div></div>
+        <div class="t-det"><div class="t-det-label">MS</div><div class="t-det-val" style="font-size:10px">${tr.ms||'—'}</div></div>
+      </div>
+    </div>`;
+  });
+  el.innerHTML=html;
+}
+function mk(label,val,color){return `<div class="card-xs"><div style="font-size:9px;color:var(--t3);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:5px">${label}</div><div style="font-family:'DM Mono',monospace;font-size:15px;font-weight:600;color:${color}">${val}</div></div>`;}
+function saveMonthNote(){
+  const key=`${currentViewYear}-${currentViewMonth}`;
+  window.monthNotes[key]=document.getElementById('m-note').value;
+  window.dbSaveNote(key,window.monthNotes[key]);
+}
+
+// ── EXPORT CSV ──
+function exportCSV(){
+  if(!window.trades.length){showToast('ไม่มีข้อมูล');return;}
+  const headers=['Date','Direction','Session','TF','Market Structure','Technique','Entry','SL','TP','Lot','Result','Profit','RR','Stars','Note'];
+  const rows=window.trades.map(t=>[t.date,t.direction,t.session||'',t.tf||'',t.ms||'',t.tech||'',t.entry||'',t.sl||'',t.tp||'',t.lot||'',t.result||'',t.profit||0,t.rr||'',t.stars||'',`"${(t.note||'').replace(/"/g,'""')}"`].join(','));
+  const csv=[headers.join(','),...rows].join('\n');
+  const blob=new Blob(['\ufeff'+csv],{type:'text/csv;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;a.download=`XAUUSD_Journal_${new Date().toISOString().slice(0,10)}.csv`;a.click();
+  URL.revokeObjectURL(url);
+  showToast('✅ Export CSV');
+}
+
+
+// ── DAY TRADES ──
+function showDayTrades(dateStr) {
+  const dt = window.trades.filter(t => t.date === dateStr);
+  if (!dt.length) return;
+  const dateLabel = new Date(dateStr + 'T12:00:00').toLocaleDateString(currentLang==='en'?'en-US':'th-TH', {weekday:'long',year:'numeric',month:'long',day:'numeric'});
+  const totalPnl = dt.reduce((s,t) => s+(t.profit||0), 0);
+  document.getElementById('day-modal-title').textContent = dateLabel;
+
+  let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;background:var(--s2);padding:12px;border-radius:var(--r1);border:1px solid var(--bdr)">
+    <div style="font-size:12px;color:var(--t3);font-weight:700">${dt.length} ${t2('kpiTrades')}</div>
+    <div style="font-family:'DM Mono',monospace;font-size:16px;font-weight:600;color:${totalPnl>=0?'var(--em)':'var(--rose)'}">${totalPnl>=0?'+':''}$${totalPnl.toFixed(2)}</div>
+  </div>`;
+
+  dt.forEach(t => {
+    const pc = t.result==='WIN'?'win':t.result==='LOSS'?'loss':'be';
+    const pnlTxt = t.profit>=0?`+$${t.profit.toFixed(2)}`:`-$${Math.abs(t.profit).toFixed(2)}`;
+    html += `<div class="trade-card ${pc}-row" onclick="closeDayModal();openDetail(${t.id})" style="margin-bottom:8px">
+      <div class="t-top">
+        <div><div class="t-chips">
+          <span class="chip ${t.direction.toLowerCase()}">${t.direction}</span>
+          ${t.tech?`<span class="chip tech">${t.tech}</span>`:''}
+          ${t.tf?`<span class="chip tf">${t.tf}</span>`:''}
+        </div></div>
+        <div class="t-right"><div class="t-pnl ${pc}">${pnlTxt}</div><div class="t-badge ${pc}">${t.result}</div></div>
+      </div>
+      <div class="t-details">
+        <div class="t-det"><div class="t-det-label">${t2('entryPrice')}</div><div class="t-det-val">${t.entry||'—'}</div></div>
+        <div class="t-det"><div class="t-det-label">RR</div><div class="t-det-val">${t.rr||'—'}</div></div>
+        <div class="t-det"><div class="t-det-label">Lot</div><div class="t-det-val">${t.lot||'—'}</div></div>
+        <div class="t-det"><div class="t-det-label">MS</div><div class="t-det-val" style="font-size:10px">${t.ms||'—'}</div></div>
+      </div>
+    </div>`;
+  });
+
+  document.getElementById('day-modal-content').innerHTML = html;
+  document.getElementById('day-modal').classList.add('open');
+}
+function closeDayModal() { document.getElementById('day-modal').classList.remove('open'); }
+
+
+// ── PORTFOLIO ──
+let portState = { capital: 0, transactions: [] };
+
+function loadPortState() {
+  const saved = localStorage.getItem('xau_portfolio');
+  if (saved) portState = JSON.parse(saved);
+}
+
+function savePortState() {
+  localStorage.setItem('xau_portfolio', JSON.stringify(portState));
+  // Sync to Firebase
+  if(window._userRef) userCol('portfolio').doc('main').set(portState);
+}
+
+function renderPortfolio() {
+  loadPortState();
+  const tradesPnl = window.trades.reduce((s,t) => s+(t.profit||0), 0);
+  const deposited = portState.transactions.filter(t=>t.type==='deposit').reduce((s,t)=>s+t.amount,0);
+  const withdrawn = portState.transactions.filter(t=>t.type==='withdraw').reduce((s,t)=>s+t.amount,0);
+  const totalCapital = portState.capital + deposited;
+  const currentBalance = totalCapital + tradesPnl - withdrawn;
+  const growth = totalCapital > 0 ? ((currentBalance - totalCapital) / totalCapital * 100) : 0;
+
+  if (portState.capital === 0) {
+    document.getElementById('port-setup').style.display = 'block';
+  } else {
+    document.getElementById('port-setup').style.display = 'none';
+  }
+
+  // Hero
+  const amtEl = document.getElementById('ph-amount');
+  amtEl.textContent = (currentBalance >= 0 ? '$' : '-$') + Math.abs(currentBalance).toFixed(2);
+  amtEl.style.color = currentBalance >= 0 ? 'var(--em)' : 'var(--rose)';
+
+  const growthEl = document.getElementById('ph-growth');
+  growthEl.textContent = (growth >= 0 ? '+' : '') + growth.toFixed(1) + '%';
+  growthEl.className = 'ph-growth ' + (growth >= 0 ? 'pos' : 'neg');
+
+  document.getElementById('ph-from').textContent = t('initCapital') + ' $' + totalCapital.toFixed(0);
+  document.getElementById('ph-profit').textContent = (tradesPnl >= 0 ? '+$' : '-$') + Math.abs(tradesPnl).toFixed(0);
+  document.getElementById('ph-capital').textContent = '$' + totalCapital.toFixed(0);
+  document.getElementById('ph-withdrawn').textContent = '$' + withdrawn.toFixed(0);
+
+  // Mini bars from trades
+  const sorted = [...window.trades].sort((a,b) => a.date.localeCompare(b.date)).slice(-10);
+  let cum = totalCapital;
+  const points = sorted.map(t => { cum += (t.profit||0); return cum; });
+  const bars = document.getElementById('ph-bars');
+  if (points.length > 1) {
+    const minP = Math.min(...points), maxP = Math.max(...points), range = maxP - minP || 1;
+    bars.innerHTML = points.map(p => {
+      const h = Math.max(8, ((p - minP) / range) * 100);
+      const color = p >= totalCapital ? `rgba(0,229,160,${0.3 + (h/100)*0.5})` : `rgba(255,77,109,${0.3 + (h/100)*0.4})`;
+      return `<div class="ph-bar" style="height:${h}%;background:${color}"></div>`;
+    }).join('');
+  } else {
+    bars.innerHTML = '';
+  }
+
+  // Transaction list — combine trades + manual tx
+  const allTx = [];
+
+  // Add manual transactions
+  portState.transactions.forEach(t => {
+    allTx.push({
+      date: t.date, type: t.type,
+      title: t.type === 'deposit' ? 'เติมเงิน' : 'ถอนเงิน',
+      sub: t.note || (t.type === 'deposit' ? 'โอนเข้าพอร์ต' : 'ถอนออกพอร์ต'),
+      amount: t.type === 'deposit' ? t.amount : -t.amount,
+      icon: t.type === 'deposit' ? '💵' : '💸',
+      iconBg: t.type === 'deposit' ? 'rgba(77,166,255,.12)' : 'rgba(29,158,117,.1)',
+      amtClass: t.type === 'deposit' ? 'dep' : 'wit'
+    });
+  });
+
+  // Add trades
+  window.trades.forEach(t => {
+    allTx.push({
+      date: t.date, type: 'trade',
+      title: `Trade ${t.result}${t.tech ? ' · '+t.tech : ''}`,
+      sub: `${t.date ? new Date(t.date+'T12:00:00').toLocaleDateString('th-TH',{day:'numeric',month:'short'}) : ''}${t.session ? ' · '+t.session.split(' (')[0] : ''}${t.direction ? ' · '+t.direction : ''}`,
+      amount: t.profit || 0,
+      icon: t.result === 'WIN' ? '📈' : t.result === 'LOSS' ? '📉' : '➖',
+      iconBg: t.result === 'WIN' ? 'rgba(0,229,160,.12)' : t.result === 'LOSS' ? 'rgba(255,77,109,.12)' : 'rgba(245,158,11,.1)',
+      amtClass: (t.profit||0) > 0 ? 'pos' : (t.profit||0) < 0 ? 'neg' : 'be'
+    });
+  });
+
+  // Sort by date desc
+  allTx.sort((a,b) => (b.date||'').localeCompare(a.date||''));
+
+  const listEl = document.getElementById('port-tx-list');
+  if (!allTx.length) {
+    listEl.innerHTML = '<div class="empty" style="padding:30px 20px"><div class="empty-icon">💼</div><div class="empty-txt">'+t('noTx')+'</div></div>';
+    return;
+  }
+
+  listEl.innerHTML = allTx.map(tx => {
+    const amtTxt = tx.amount >= 0 ? `+$${tx.amount.toFixed(2)}` : `-$${Math.abs(tx.amount).toFixed(2)}`;
+    const amtColor = tx.amtClass === 'pos' ? 'var(--em)' : tx.amtClass === 'neg' ? 'var(--rose)' : tx.amtClass === 'dep' ? 'var(--blue)' : 'var(--em)';
+    return `<div class="tx-item">
+      <div class="tx-icon" style="background:${tx.iconBg}">${tx.icon}</div>
+      <div class="tx-mid"><div class="tx-title">${tx.title}</div><div class="tx-sub">${tx.sub}</div></div>
+      <div class="tx-amount" style="color:${amtColor}">${amtTxt}</div>
+    </div>`;
+  }).join('');
+
+  updateTopbar('portfolio');
+}
+
+function setInitCapital() {
+  const val = parseFloat(document.getElementById('port-init-input').value);
+  if (!val || val <= 0) { showToast('⚠️ ใส่ทุนเริ่มต้นก่อน'); return; }
+  portState.capital = val;
+  portState.transactions = portState.transactions || [];
+  savePortState();
+  renderPortfolio();
+  showToast('✅ ตั้งทุนเริ่มต้นแล้ว');
+}
+
+let portModalType = 'deposit';
+function openPortModal(type) {
+  portModalType = type;
+  document.getElementById('port-modal-title').innerHTML = (type === 'deposit' ? t('deposit') : t('withdraw')) + ' <button class="modal-close" onclick="closePortModal()">×</button>';
+  document.getElementById('port-modal-amount').value = '';
+  document.getElementById('port-modal-note').value = '';
+  document.getElementById('port-modal-save').style.background = type === 'deposit' ? 'var(--em)' : 'var(--rose)';
+  document.getElementById('port-modal').classList.add('open');
+}
+function closePortModal() { document.getElementById('port-modal').classList.remove('open'); }
+
+function savePortTx() {
+  const amount = parseFloat(document.getElementById('port-modal-amount').value);
+  if (!amount || amount <= 0) { showToast('⚠️ ใส่จำนวนเงินก่อน'); return; }
+  const note = document.getElementById('port-modal-note').value;
+  portState.transactions = portState.transactions || [];
+  portState.transactions.unshift({
+    id: Date.now(),
+    type: portModalType,
+    amount,
+    note,
+    date: new Date().toISOString().slice(0,10)
+  });
+  savePortState();
+  closePortModal();
+  renderPortfolio();
+  showToast(portModalType === 'deposit' ? '✅ '+t('deposit') : '✅ '+t('withdraw'));
+}
+
+// Load portfolio from Firebase on init (called after auth ready)
+window._loadPortFromFirebase = function() {
+  if (!window._userRef) return;
+  userCol('portfolio').doc('main').get().then(doc => {
+    if (doc.exists) { portState = doc.data(); localStorage.setItem('xau_portfolio', JSON.stringify(portState)); }
+  }).catch(() => loadPortState());
+};
+
+// ── FILTER ──
+document.querySelectorAll('.fchip').forEach(c=>{c.addEventListener('click',function(){document.querySelectorAll('.fchip').forEach(x=>x.classList.remove('active'));this.classList.add('active');currentFilter=this.dataset.filter;renderLog();});});
+
+// ── TOAST ──
+function showToast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200);}
+
+// ── MODAL CLOSE ──
+document.getElementById('detail-modal').addEventListener('click',function(e){if(e.target===this)closeModal();});
+document.getElementById('edit-modal').addEventListener('click',function(e){if(e.target===this)closeEditModal();});
+document.getElementById('day-modal').addEventListener('click',function(e){if(e.target===this)closeDayModal();});
+document.getElementById('port-modal').addEventListener('click',function(e){if(e.target===this)closePortModal();});
+window.addEventListener('resize',()=>{if(document.getElementById('screen-dash').classList.contains('active'))drawEquity();});
+
+// ── INIT ──
+makeChipGroup('ms-group','ms');
+makeChipGroup('tech-group','tech');
+document.getElementById('f-date').value=new Date().toISOString().slice(0,10);
+setStar(3);initMonth();
+
+window._appInit=function(){initMonth();renderDash();};
+window.renderDash=renderDash;
+window.renderLog=renderLog;
+window.renderMonthly=renderMonthly;
+
+// ── SETTINGS STATE ──
+const DEFAULT_SETTINGS = {
+  lossLimit: 300,
+  tfList: ['M1','M5','M15','M30','H1','H4','D1'],
+  techList: ['ในกรอบ','ไม้รวย','แนวเด้ง','ตามแรง','ตามเจ้า','ปลายไส้'],
+  msList: ['เทรนขึ้น','เทรนลง','SW ยกขึ้น','SW กดลง','ภูเขาโซนล่าง','ภูเขาโซนบน','ไม่ชัด']
+};
+let settingsState = {...DEFAULT_SETTINGS};
+try { const s=localStorage.getItem('xau_settings'); if(s){ const p=JSON.parse(s); settingsState={...DEFAULT_SETTINGS,...p}; } } catch(e){}
+
+function saveSettingsState(){
+  localStorage.setItem('xau_settings', JSON.stringify(settingsState));
+  try { if(window._userRef) userCol('settings').doc('main').set(settingsState); } catch(e){}
+}
+
+// Load settings from firebase on start (deferred after auth)
+window._loadSettingsFromFirebase = function() {
+  if (!window._userRef) return;
+  try {
+    userCol('settings').doc('main').get().then(doc=>{
+      if(doc.exists){ settingsState={...DEFAULT_SETTINGS,...doc.data()}; localStorage.setItem('xau_settings',JSON.stringify(settingsState)); applySettingsToForms(); }
+    }).catch(()=>{});
+  } catch(e){}
+};
+
+function applySettingsToForms(){
+  // Rebuild TF select in new trade form
+  const tfSel = document.getElementById('f-tf');
+  if(tfSel){ const cur=tfSel.value; tfSel.innerHTML=settingsState.tfList.map(v=>`<option${v===cur||v==='H1'?' selected':''}>${v}</option>`).join(''); }
+  const eTfSel = document.getElementById('e-tf');
+  if(eTfSel){ eTfSel.innerHTML=settingsState.tfList.map(v=>`<option>${v}</option>`).join(''); }
+  // Rebuild tech chips in new trade form
+  const techGroup = document.getElementById('tech-group');
+  if(techGroup){ techGroup.innerHTML=settingsState.techList.map(v=>`<div class="sch" data-val="${v}">${v}</div>`).join(''); makeChipGroup('tech-group','tech'); }
+  const eTechGroup = document.getElementById('e-tech-group');
+  if(eTechGroup){ eTechGroup.innerHTML=settingsState.techList.map(v=>`<div class="sch" data-val="${v}">${v}</div>`).join(''); document.querySelectorAll('#e-tech-group .sch').forEach(c=>{c.addEventListener('click',function(){document.querySelectorAll('#e-tech-group .sch').forEach(x=>x.classList.remove('sel'));this.classList.add('sel');editState.tech=this.dataset.val;}); }); }
+  // Rebuild MS chips
+  const msGroup = document.getElementById('ms-group');
+  if(msGroup){ msGroup.innerHTML=settingsState.msList.map(v=>`<div class="sch" data-val="${v}">${v}</div>`).join(''); makeChipGroup('ms-group','ms'); }
+  const eMsGroup = document.getElementById('e-ms-group');
+  if(eMsGroup){ eMsGroup.innerHTML=settingsState.msList.map(v=>`<div class="sch" data-val="${v}">${v}</div>`).join(''); document.querySelectorAll('#e-ms-group .sch').forEach(c=>{c.addEventListener('click',function(){document.querySelectorAll('#e-ms-group .sch').forEach(x=>x.classList.remove('sel'));this.classList.add('sel');editState.ms=this.dataset.val;}); }); }
+}
+
+function openSettings(){
+  loadPortState();
+  const cap = portState.capital || 0;
+  document.getElementById('sett-cap-sub').textContent = '$' + cap.toFixed(2);
+  document.getElementById('sett-loss-disp').textContent = '-$' + (settingsState.lossLimit || 300);
+  document.getElementById('sett-cap-input').value = cap || '';
+  document.getElementById('sett-loss-input').value = settingsState.lossLimit || 300;
+  document.getElementById('sett-tf-sub').textContent = settingsState.tfList.join(', ');
+  document.getElementById('sett-tech-sub').textContent = settingsState.techList.join(', ');
+  document.getElementById('sett-ms-sub').textContent = settingsState.msList.join(', ');
+  // hide all sub panels
+  ['sett-capital-panel','sett-loss-panel','sett-tf-panel','sett-tech-panel','sett-ms-panel'].forEach(id=>{
+    const el=document.getElementById(id); if(el) el.style.display='none';
+  });
+  document.getElementById('settings-modal').classList.add('open');
+}
+function closeSettings(){ document.getElementById('settings-modal').classList.remove('open'); }
+
+function _toggleSettPanel(id){
+  const panels=['sett-capital-panel','sett-loss-panel','sett-tf-panel','sett-tech-panel','sett-ms-panel','sett-profile-panel','sett-security-panel'];
+  panels.forEach(p=>{ if(p!==id){ const el=document.getElementById(p); if(el) el.style.display='none'; } });
+  const el=document.getElementById(id);
+  if(el) el.style.display = el.style.display==='none'?'block':'none';
+}
+
+function openSettCapital(){ _toggleSettPanel('sett-capital-panel'); }
+function openSettLossLimit(){ _toggleSettPanel('sett-loss-panel'); }
+
+function openSettTF(){
+  _toggleSettPanel('sett-tf-panel');
+  if(document.getElementById('sett-tf-panel').style.display!=='none') renderSettChips('sett-tf-chips', settingsState.tfList, 'tf');
+}
+function openSettTech(){
+  _toggleSettPanel('sett-tech-panel');
+  if(document.getElementById('sett-tech-panel').style.display!=='none') renderSettChips('sett-tech-chips', settingsState.techList, 'tech');
+}
+function openSettMS(){
+  _toggleSettPanel('sett-ms-panel');
+  if(document.getElementById('sett-ms-panel').style.display!=='none') renderSettChips('sett-ms-chips', settingsState.msList, 'ms');
+}
+
+function renderSettChips(containerId, list, type){
+  const el=document.getElementById(containerId);
+  if(!el) return;
+  el.innerHTML = list.map((v,i)=>`
+    <div style="display:flex;align-items:center;gap:4px;background:var(--s3);border:1px solid var(--bdr2);border-radius:8px;padding:6px 10px">
+      <span style="font-size:12px;font-weight:600;color:var(--t1)">${v}</span>
+      <button onclick="removeSettItem('${type}',${i})" style="background:none;border:none;color:var(--t3);font-size:16px;cursor:pointer;line-height:1;padding:0 0 0 4px">×</button>
+    </div>`).join('');
+}
+
+function removeSettItem(type, idx){
+  if(type==='tf') settingsState.tfList.splice(idx,1);
+  else if(type==='tech') settingsState.techList.splice(idx,1);
+  else if(type==='ms') settingsState.msList.splice(idx,1);
+  renderSettChips(`sett-${type}-chips`, settingsState[`${type}List`], type);
+}
+
+function addCustomTF(){
+  const v=document.getElementById('sett-tf-new').value.trim().toUpperCase();
+  if(!v){ showToast('⚠️ ใส่ชื่อ TF ก่อน'); return; }
+  if(settingsState.tfList.includes(v)){ showToast('มีแล้ว'); return; }
+  settingsState.tfList.push(v);
+  document.getElementById('sett-tf-new').value='';
+  renderSettChips('sett-tf-chips', settingsState.tfList, 'tf');
+}
+function addCustomTech(){
+  const v=document.getElementById('sett-tech-new').value.trim();
+  if(!v){ showToast('⚠️ ใส่ชื่อก่อน'); return; }
+  if(settingsState.techList.includes(v)){ showToast('มีแล้ว'); return; }
+  settingsState.techList.push(v);
+  document.getElementById('sett-tech-new').value='';
+  renderSettChips('sett-tech-chips', settingsState.techList, 'tech');
+}
+function addCustomMS(){
+  const v=document.getElementById('sett-ms-new').value.trim();
+  if(!v){ showToast('⚠️ ใส่ชื่อก่อน'); return; }
+  if(settingsState.msList.includes(v)){ showToast('มีแล้ว'); return; }
+  settingsState.msList.push(v);
+  document.getElementById('sett-ms-new').value='';
+  renderSettChips('sett-ms-chips', settingsState.msList, 'ms');
+}
+
+function saveSettCapital(){
+  const val = parseFloat(document.getElementById('sett-cap-input').value);
+  if(!val||val<=0){ showToast('⚠️ ใส่ทุนก่อน'); return; }
+  portState.capital = val;
+  portState.transactions = portState.transactions || [];
+  savePortState();
+  document.getElementById('sett-cap-sub').textContent = '$' + val.toFixed(2);
+  document.getElementById('sett-capital-panel').style.display='none';
+  renderPortfolio();
+  showToast('✅ บันทึกทุนเริ่มต้นแล้ว');
+}
+function saveSettLoss(){
+  const val = parseFloat(document.getElementById('sett-loss-input').value);
+  if(!val||val<=0){ showToast('⚠️ ใส่จำนวนก่อน'); return; }
+  settingsState.lossLimit = val;
+  saveSettingsState();
+  document.getElementById('sett-loss-disp').textContent = '-$' + val;
+  document.getElementById('sett-loss-panel').style.display='none';
+  renderDash();
+  showToast('✅ บันทึก Loss Limit แล้ว');
+}
+function saveSettTF(){
+  if(!settingsState.tfList.length){ showToast('⚠️ ต้องมีอย่างน้อย 1 TF'); return; }
+  saveSettingsState();
+  document.getElementById('sett-tf-sub').textContent = settingsState.tfList.join(', ');
+  document.getElementById('sett-tf-panel').style.display='none';
+  applySettingsToForms();
+  showToast('✅ บันทึก TF แล้ว');
+}
+function saveSettTech(){
+  if(!settingsState.techList.length){ showToast('⚠️ ต้องมีอย่างน้อย 1 Technique'); return; }
+  saveSettingsState();
+  document.getElementById('sett-tech-sub').textContent = settingsState.techList.join(', ');
+  document.getElementById('sett-tech-panel').style.display='none';
+  applySettingsToForms();
+  showToast('✅ บันทึก Technique แล้ว');
+}
+function saveSettMS(){
+  if(!settingsState.msList.length){ showToast('⚠️ ต้องมีอย่างน้อย 1 MS'); return; }
+  saveSettingsState();
+  document.getElementById('sett-ms-sub').textContent = settingsState.msList.join(', ');
+  document.getElementById('sett-ms-panel').style.display='none';
+  applySettingsToForms();
+  showToast('✅ บันทึก Market Structure แล้ว');
+}
+function clearAllData(){
+  if(!confirm('⚠️ ลบข้อมูลทั้งหมด? ไม่สามารถกู้คืนได้')) return;
+  window._trades=[];
+  portState={capital:0,transactions:[]};
+  savePortState();
+  if(window._userRef) userCol('trades').get().then(snap=>{ const batch=db.batch(); snap.forEach(d=>batch.delete(d.ref)); return batch.commit(); });
+  closeSettings();
+  renderDash(); renderLog();
+  showToast('🗑 ลบข้อมูลทั้งหมดแล้ว');
+}
+document.getElementById('settings-modal').addEventListener('click',function(e){if(e.target===this)closeSettings();});
+// Apply settings to forms on load
+setTimeout(applySettingsToForms, 100);
+
+
+// ── PIN LOCK ──
+let pinBuffer = '';
+const PIN_KEY = 'xau_pin';
+const PROFILE_KEY = 'xau_profile';
+
+function checkPINOnLoad() {
+  const savedPIN = localStorage.getItem(PIN_KEY);
+  if (savedPIN) {
+    document.getElementById('pin-lock').style.display = 'flex';
+    document.querySelector('.app').style.opacity = '0';
+  }
+}
+
+function pinPress(digit) {
+  if (pinBuffer.length >= 4) return;
+  pinBuffer += digit;
+  updatePinDots();
+  if (pinBuffer.length === 4) {
+    setTimeout(() => {
+      const saved = localStorage.getItem(PIN_KEY);
+      if (pinBuffer === saved) {
+        document.getElementById('pin-lock').style.display = 'none';
+        document.querySelector('.app').style.opacity = '1';
+        if (window._appInit && !window._fbReady) {
+          // wait for firebase
+        } else if (window._fbReady) {
+          renderDash();
+        }
+      } else {
+        document.getElementById('pin-error').textContent = '❌ PIN ไม่ถูกต้อง';
+        setTimeout(() => {
+          pinBuffer = '';
+          updatePinDots();
+          document.getElementById('pin-error').textContent = '';
+        }, 1000);
+      }
+    }, 150);
+  }
+}
+
+function pinBackspace() {
+  pinBuffer = pinBuffer.slice(0, -1);
+  updatePinDots();
+}
+
+function updatePinDots() {
+  document.querySelectorAll('.pin-dot').forEach((d, i) => {
+    d.classList.toggle('filled', i < pinBuffer.length);
+  });
+}
+
+function saveSettPIN() {
+  const p1 = document.getElementById('sett-pin-input').value;
+  const p2 = document.getElementById('sett-pin-confirm').value;
+  if (p1.length !== 4 || !/^\d{4}$/.test(p1)) { showToast('⚠️ PIN ต้องเป็นตัวเลข 4 หลัก'); return; }
+  if (p1 !== p2) { showToast('⚠️ PIN ไม่ตรงกัน'); return; }
+  localStorage.setItem(PIN_KEY, p1);
+  document.getElementById('sett-pin-input').value = '';
+  document.getElementById('sett-pin-confirm').value = '';
+  document.getElementById('sett-pin-sub').textContent = 'PIN ตั้งค่าแล้ว ✓';
+  document.getElementById('sett-clear-pin-btn').style.display = 'block';
+  document.getElementById('sett-security-panel').style.display = 'none';
+  showToast('✅ ตั้ง PIN แล้ว');
+}
+
+function clearPIN() {
+  if (!confirm('ลบ PIN ออก? แอปจะไม่ล็อคอีก')) return;
+  localStorage.removeItem(PIN_KEY);
+  document.getElementById('sett-pin-sub').textContent = 'PIN, Biometric lock';
+  document.getElementById('sett-clear-pin-btn').style.display = 'none';
+  showToast('🔓 ลบ PIN แล้ว');
+}
+
+function openSettSecurity() {
+  _toggleSettPanel('sett-security-panel');
+  const hasPIN = !!localStorage.getItem(PIN_KEY);
+  document.getElementById('sett-pin-sub').textContent = hasPIN ? 'PIN ตั้งค่าแล้ว ✓' : 'PIN, Biometric lock';
+  document.getElementById('sett-clear-pin-btn').style.display = hasPIN ? 'block' : 'none';
+}
+
+// ── PROFILE ──
+function openSettProfile() {
+  _toggleSettPanel('sett-profile-panel');
+  const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
+  document.getElementById('sett-name-input').value = profile.name || '';
+}
+
+function saveSettProfile() {
+  const name = document.getElementById('sett-name-input').value.trim();
+  if (!name) { showToast('⚠️ ใส่ชื่อก่อน'); return; }
+  const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
+  profile.name = name;
+  localStorage.setItem(PROFILE_KEY, JSON.stringify(profile));
+  // Update display
+  document.getElementById('sett-profile-name').textContent = name;
+  const initials = name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2);
+  document.getElementById('sett-avatar-initials').textContent = initials;
+  document.getElementById('sett-profile-panel').style.display = 'none';
+  showToast('✅ บันทึก Profile แล้ว');
+}
+
+function loadProfile() {
+  const profile = JSON.parse(localStorage.getItem(PROFILE_KEY) || '{}');
+  if (profile.name) {
+    document.getElementById('sett-profile-name').textContent = profile.name;
+    const initials = profile.name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0, 2);
+    document.getElementById('sett-avatar-initials').textContent = initials;
+  }
+}
+
+// ── SYNC TOGGLE ──
+let syncEnabled = true;
+function toggleSync() {
+  syncEnabled = !syncEnabled;
+  const tog = document.getElementById('sett-sync-toggle');
+  if (syncEnabled) {
+    tog.style.background = 'var(--em)';
+    tog.querySelector('.sett-toggle-dot').style.left = '19px';
+    showToast('☁️ Sync เปิดแล้ว');
+  } else {
+    tog.style.background = 'var(--s3)';
+    tog.querySelector('.sett-toggle-dot').style.left = '3px';
+    showToast('📴 Sync ปิดแล้ว');
+  }
+  settingsState.syncEnabled = syncEnabled;
+  saveSettingsState();
+}
+
+// ── THEME ──
+let isDark = false;
+function toggleTheme() {
+  isDark = !isDark;
+  applyTheme(isDark);
+  settingsState.theme = isDark ? 'dark' : 'light';
+  saveSettingsState();
+}
+
+function applyTheme(dark) {
+  const root = document.documentElement;
+  if (dark) {
+    root.style.setProperty('--bg', '#05080F');
+    root.style.setProperty('--s1', '#0B1020');
+    root.style.setProperty('--s2', '#111827');
+    root.style.setProperty('--s3', '#1C2A3A');
+    root.style.setProperty('--t1', '#F0F4FF');
+    root.style.setProperty('--t2', '#8BA0BC');
+    root.style.setProperty('--t3', '#4A5C70');
+    root.style.setProperty('--gold', '#00E5A0');
+    root.style.setProperty('--gold2', 'rgba(0,229,160,.1)');
+    root.style.setProperty('--em', '#00E5A0');
+    root.style.setProperty('--em2', 'rgba(0,229,160,.1)');
+    root.style.setProperty('--rose', '#FF4D6D');
+    root.style.setProperty('--amber', '#FF9F1C');
+    root.style.setProperty('--blue', '#4DA6FF');
+    root.style.setProperty('--bdr', 'rgba(255,255,255,0.06)');
+    root.style.setProperty('--bdr2', 'rgba(255,255,255,0.1)');
+    root.style.setProperty('--topbar-bg', 'rgba(5,8,15,0.92)');
+    root.style.setProperty('--nav-bg', 'rgba(11,16,32,0.97)');
+    document.body.style.background = '#05080F';
+    const tog = document.getElementById('sett-theme-toggle');
+    if (tog) { tog.style.background = 'var(--em)'; tog.querySelector('.sett-toggle-dot').style.left = '19px'; }
+    const sub = document.getElementById('sett-theme-sub'); if (sub) sub.textContent = 'Dark mode';
+  } else {
+    root.style.setProperty('--bg', '#F4F7FA');
+    root.style.setProperty('--s1', '#FFFFFF');
+    root.style.setProperty('--s2', '#FFFFFF');
+    root.style.setProperty('--s3', '#EEF1F6');
+    root.style.setProperty('--t1', '#0F172A');
+    root.style.setProperty('--t2', '#475569');
+    root.style.setProperty('--t3', '#94A3B8');
+    root.style.setProperty('--gold', '#1D9E75');
+    root.style.setProperty('--gold2', 'rgba(29,158,117,.08)');
+    root.style.setProperty('--em', '#1D9E75');
+    root.style.setProperty('--em2', 'rgba(29,158,117,.08)');
+    root.style.setProperty('--rose', '#E24B4A');
+    root.style.setProperty('--amber', '#BA7517');
+    root.style.setProperty('--blue', '#185FA5');
+    root.style.setProperty('--bdr', 'rgba(0,0,0,0.07)');
+    root.style.setProperty('--bdr2', 'rgba(0,0,0,0.12)');
+    root.style.setProperty('--topbar-bg', 'rgba(255,255,255,0.92)');
+    root.style.setProperty('--nav-bg', 'rgba(255,255,255,0.95)');
+    document.body.style.background = '#F4F7FA';
+    const tog = document.getElementById('sett-theme-toggle');
+    if (tog) { tog.style.background = 'var(--s3)'; tog.querySelector('.sett-toggle-dot').style.left = '3px'; }
+    const sub = document.getElementById('sett-theme-sub'); if (sub) sub.textContent = 'Light mode';
+  }
+}
+
+// ── LANGUAGE ──
+let currentLang = 'th';
+
+const LANG = {
+  th: {
+    // Nav
+    dash:'แดชบอร์ด', log:'บันทึก', newTrade:'เพิ่ม', monthly:'รายเดือน', port:'พอร์ต',
+    badge:'TH ไทย',
+    // Topbar
+    appTitle:'XAUUSD Journal',
+    // Dashboard
+    overallWR:'Win Rate รวม', equityCurve:'กราฟผลตอบแทน',
+    wrBySession:'Win Rate ตาม Session', wrByTech:'Win Rate ตามเทคนิค', wrByMS:'Win Rate ตามโครงสร้างตลาด',
+    netPnl:'กำไร/ขาดทุนสุทธิ', bestTrade:'เทรดที่ดีที่สุด', avgRR:'RR เฉลี่ย', profitFactor:'Profit Factor',
+    trades:'เทรดทั้งหมด', worst:'แย่สุด: ', streak:'ชนะ/แพ้ติดกัน: ',
+    // Form sections
+    context:'บริบท', result:'ผลลัพธ์', review:'บทวิเคราะห์',
+    // Form labels
+    date:'วันที่', tf:'TF', ms:'Market Structure',
+    entryPrice:'ราคาเข้า', entry:'ราคาเข้า', session:'Session', technique:'เทคนิค',
+    slDist:'SL (ระยะ pips)', tpDist:'TP (ระยะ pips)',
+    lotSize:'ขนาด Lot', perPip:'$ ต่อ pip',
+    outcome:'ผลการเทรด', actualPnl:'กำไร/ขาดทุนจริง ($)', setupQuality:'คุณภาพ Setup',
+    note:'บันทึก', screenshot:'ภาพหน้าจอ',
+    addPhoto:'แตะเพื่อเพิ่มรูป',
+    saveBtn:'บันทึก Trade →',
+    // Results
+    win:'WIN', loss:'LOSS', be:'BE',
+    // Log
+    exportCSV:'⬇ Export CSV',
+    all:'ทั้งหมด', buy:'BUY', sell:'SELL',
+    noTrades:'ยังไม่มีเทรด — กด เพิ่ม เพื่อเพิ่มเทรดแรก!', noFilter:'ไม่มีเทรดที่ตรงกับที่เลือก',
+    // Monthly
+    bestTradeLabel:'Trade ที่ดีที่สุด', worstTradeLabel:'Trade ที่แย่ที่สุด',
+    pnlCalendar:'ปฏิทิน P&L', breakdown:'สรุปผล', monthlyNotes:'บันทึกประจำเดือน',
+    monthlyNotePlaceholder:'สรุปเดือนนี้...',
+    // Portfolio
+    currentBalance:'ยอดพอร์ตปัจจุบัน', initCapital:'ทุนเริ่มต้น',
+    profit:'กำไรสะสม', capital:'ทุนเริ่มต้น', withdrawn:'ถอนแล้ว',
+    deposit:'เติมเงิน', withdraw:'ถอนเงิน',
+    txHistory:'ประวัติธุรกรรม', noTx:'ยังไม่มีธุรกรรม',
+    setCapital:'ตั้งทุนเริ่มต้น →',
+    // Settings
+    settings:'บัญชี', profile:'โปรไฟล์', security:'ความปลอดภัย',
+    syncBackup:'ซิงค์ & สำรองข้อมูล', journalDefaults:'ตั้งค่า Journal',
+    initCapitalSett:'ทุนเริ่มต้น', dailyLoss:'ขาดทุนสูงสุดต่อวัน', dailyLossSub:'แจ้งเตือนเมื่อขาดทุนถึง',
+    customForm:'ปรับแต่งฟอร์ม', display:'การแสดงผล', data:'ข้อมูล',
+    theme:'ธีม', language:'ภาษา / Language', langSub:'ภาษาไทย',
+    exportData:'Export CSV', clearData:'ลบข้อมูลทั้งหมด',
+    // Detail modal
+    tradeDetail:'รายละเอียด Trade', editBtn:'✏️ แก้ไข', deleteBtn:'🗑 ลบ Trade นี้',
+    // Edit modal
+    editTrade:'แก้ไข Trade', saveEdit:'บันทึกการแก้ไข ✓',
+    // PIN
+    pinTitle:'XAUUSD Journal', pinSub:'ใส่ PIN เพื่อเข้าใช้งาน',
+    // Loss warning
+    lossWarnDay:'ขาดทุนวันนี้ถึง', lossWarnLimit:'— เกิน ขาดทุนสูงสุดต่อวัน', lossWarnStop:'พิจารณาหยุดพักก่อนนะครับ',
+    lossWarnStreak:'แพ้ติดกัน', lossWarnStreakSuf:'ครั้ง — พิจารณาหยุดพักก่อนนะครับ',
+    // KPI subs
+    kpiTrades:'เทรด',
+  },
+  en: {
+    // Nav
+    dash:'Dashboard', log:'Log', newTrade:'New', monthly:'Monthly', port:'Portfolio',
+    badge:'EN ENG',
+    // Topbar
+    appTitle:'XAUUSD Journal',
+    // Dashboard
+    overallWR:'Overall Win Rate', equityCurve:'Equity Curve',
+    wrBySession:'Win Rate by Session', wrByTech:'Win Rate by Technique', wrByMS:'Win Rate by Market Structure',
+    netPnl:'Net P&L', bestTrade:'Best Trade', avgRR:'Avg RR', profitFactor:'Profit Factor',
+    trades:'trades total', worst:'Worst:', streak:'Streak:',
+    // Form sections
+    context:'Context', result:'Result', review:'Review',
+    // Form labels
+    date:'Date', tf:'TF', ms:'Market Structure',
+    entryPrice:'Entry', entry:'Entry', session:'Session', technique:'Technique', slDist:'SL (pips)', tpDist:'TP (pips)',
+    lotSize:'Lot Size', perPip:'$ per pip',
+    outcome:'Outcome', actualPnl:'Actual Profit/Loss ($)', setupQuality:'Setup Quality',
+    note:'Note', screenshot:'Screenshot',
+    addPhoto:'Tap to add image',
+    saveBtn:'Save Trade →',
+    // Results
+    win:'WIN', loss:'LOSS', be:'BE',
+    // Log
+    exportCSV:'⬇ Export CSV',
+    all:'All', buy:'BUY', sell:'SELL',
+    noTrades:'No trades yet — Tap New to add your first trade!', noFilter:'No trades match this filter',
+    // Monthly
+    bestTradeLabel:'Best Trade', worstTradeLabel:'Worst Trade',
+    pnlCalendar:'P&L Calendar', breakdown:'Breakdown', monthlyNotes:'Monthly Notes',
+    monthlyNotePlaceholder:'Monthly reflection...',
+    // Portfolio
+    currentBalance:'Current Balance', initCapital:'Initial Capital',
+    profit:'Total Profit', capital:'Initial Capital', withdrawn:'Withdrawn',
+    deposit:'Deposit', withdraw:'Withdraw',
+    txHistory:'Transaction History', noTx:'No transactions yet',
+    setCapital:'Set Initial Capital →',
+    // Settings
+    settings:'Account', profile:'Profile', security:'Security',
+    syncBackup:'Sync & Backup', journalDefaults:'Journal Defaults',
+    initCapitalSett:'Initial Capital', dailyLoss:'Daily Loss Limit', dailyLossSub:'Alert when loss reaches',
+    customForm:'Customize Form', display:'Display', data:'Data',
+    theme:'Theme', language:'Language', langSub:'English',
+    exportData:'Export CSV', clearData:'Clear All Data',
+    // Detail modal
+    tradeDetail:'Trade Detail', editBtn:'✏️ Edit', deleteBtn:'🗑 Delete Trade',
+    // Edit modal
+    editTrade:'Edit Trade', saveEdit:'Save Changes ✓',
+    // PIN
+    pinTitle:'XAUUSD Journal', pinSub:'Enter PIN to continue',
+    // Loss warning
+    lossWarnDay:'Today loss reached', lossWarnLimit:'— exceeded Daily Loss Limit', lossWarnStop:'Consider taking a break.',
+    lossWarnStreak:'Lost', lossWarnStreakSuf:'in a row — consider taking a break.',
+    // KPI subs
+    kpiTrades:'trades',
+  }
+};
+
+function applyLang() {
+  const L = LANG[currentLang];
+  // Nav labels
+  const navScreens = ['dash','log','new','monthly','portfolio'];
+  const navKeys = [L.dash, L.log, L.newTrade, L.monthly, L.port];
+  document.querySelectorAll('.nb-label').forEach((el,i) => { if(navKeys[i]) el.textContent = navKeys[i]; });
+  // Lang badge + sub
+  const badge = document.getElementById('sett-lang-badge'); if(badge) badge.textContent = L.badge;
+  const sub = document.getElementById('sett-lang-sub'); if(sub) sub.textContent = L.langSub;
+  // Section headers (data-lang attr)
+  document.querySelectorAll('[data-lang]').forEach(el => {
+    const key = el.getAttribute('data-lang');
+    if(L[key]) el.textContent = L[key];
+  });
+  // Form labels
+  setText('f-label-date', L.date); setText('f-label-tf', L.tf);
+  setText('f-label-session', L.session); setText('f-label-ms', L.ms);
+  setText('f-label-tech', L.technique); setText('f-label-entry', L.entryPrice);
+  setText('f-label-sl', L.slDist); setText('f-label-tp', L.tpDist);
+  setText('f-label-lot', L.lotSize); setText('f-label-pipp', L.perPip);
+  setText('f-label-outcome', L.outcome); setText('f-label-profit', L.actualPnl);
+  setText('f-label-quality', L.setupQuality); setText('f-label-note', L.note);
+  setText('f-label-screenshot', L.screenshot);
+  // Save button
+  setText('save-btn-main', L.saveBtn);
+  // Filter chips
+  setText('fchip-all', L.all);
+  setText('fchip-win', currentLang==='en'?'WIN':'ชนะ');
+  setText('fchip-loss', currentLang==='en'?'LOSS':'แพ้');
+  setText('fchip-be', currentLang==='en'?'BE':'เสมอ');
+  setText('fchip-buy', currentLang==='en'?'BUY':'ซื้อ');
+  setText('fchip-sell', currentLang==='en'?'SELL':'ขาย');
+  // Export btn
+  document.querySelectorAll('.export-btn').forEach(el => el.textContent = L.exportCSV);
+  // Section labels in dash
+  setText('sec-equity', L.equityCurve); setText('sec-session', L.wrBySession);
+  setText('sec-tech', L.wrByTech); setText('sec-ms', L.wrByMS);
+  // Portfolio
+  setText('ph-label-el', L.currentBalance); setText('ph-profit-label', L.profit);
+  setText('ph-capital-label', L.capital); setText('ph-withdrawn-label', L.withdrawn);
+  setText('ph-from-label', L.initCapital);
+  setText('sec-tx', L.txHistory);
+  // Static modal/button labels
+  setText('det-modal-title', L.tradeDetail);
+  setText('edit-modal-title', L.editTrade);
+  setText('save-edit-btn', L.saveEdit);
+  setText('delete-edit-btn', L.deleteBtn);
+  setText('set-capital-btn', L.setCapital);
+  setText('port-deposit-label', L.deposit);
+  setText('port-withdraw-label', L.withdraw);
+  // Monthly labels
+  setText('m-kpi-pnl-label', currentLang==='en'?'Net P&L':'กำไร & ขาดทุน');
+  setText('m-kpi-wr-label', currentLang==='en'?'Win Rate':'อัตราชนะ');
+  setText('m-kpi-trades-label', currentLang==='en'?'Trades':'เทรด');
+  setText('sec-best-worst', currentLang==='en'?'Best / Worst':'ดีที่สุด / แย่ที่สุด');
+  setText('sec-cal', currentLang==='en'?'P&L Calendar':'ปฏิทิน P&L');
+  setText('sec-breakdown', currentLang==='en'?'Breakdown':'สรุป');
+  setText('sec-monthly-notes', currentLang==='en'?'Monthly Notes':'บันทึกประจำเดือน');
+  setText('cal-win-label', currentLang==='en'?'Win':'ชนะ');
+  setText('cal-loss-label', currentLang==='en'?'Loss':'แพ้');
+  setText('cal-be-label', 'BE');
+  setText('cal-notrade-label', currentLang==='en'?'No trade':'ไม่มีเทรด');
+  // Note placeholder
+  const mnote = document.getElementById('m-note'); if(mnote) mnote.placeholder = L.monthlyNotePlaceholder;
+  const fnote = document.getElementById('f-note'); if(fnote) fnote.placeholder = currentLang==='en'?'Setup, what worked, what didn\'t...':'Setup, สิ่งที่ดี, สิ่งที่ควรแก้ไข...';
+  // Settings
+  // Settings modal & sections
+  setText('sett-modal-title', currentLang==='en'?'Settings':'ตั้งค่า');
+  setText('sett-sec-account', L.settings);
+  setText('sett-sec-journal', L.journalDefaults);
+  setText('sett-sec-form', L.customForm);
+  setText('sett-sec-display', L.display);
+  setText('sett-sec-data', L.data);
+  // Settings rows
+  setText('sett-row-profile', L.profile);
+  setText('sett-sub-profile', currentLang==='en'?'Edit your profile':'ตั้งค่าโปรไฟล์');
+  setText('sett-row-security', L.security);
+  setText('sett-row-sync', L.syncBackup);
+  setText('sett-sub-sync', currentLang==='en'?'Firebase · Online':'Firebase · ออนไลน์');
+  setText('sett-row-capital', L.initCapitalSett);
+  setText('sett-row-loss', L.dailyLoss);
+  setText('sett-daily-loss-sub', L.dailyLossSub);
+  setText('sett-row-tf', 'Timeframe (TF)');
+  setText('sett-row-technique', 'Technique');
+  setText('sett-row-ms-sett', 'Market Structure');
+  setText('sett-row-theme', L.theme);
+  setText('sett-row-lang', L.language);
+  setText('sett-row-export', 'Export CSV');
+  setText('sett-sub-export', currentLang==='en'?'Download trade history':'ดาวน์โหลด trade history');
+  setText('sett-row-clear', L.clearData);
+  setText('sett-sub-clear', currentLang==='en'?'Delete all data':'ลบข้อมูลทั้งหมด');
+  // Auto calc labels
+  setText('ac-label-rr', currentLang==='en'?'RR Ratio':'RR Ratio');
+  setText('ac-label-pips', currentLang==='en'?'Pips SL':'Pips SL');
+  setText('ac-label-pl', currentLang==='en'?'Est. P/L':'ประเมิน P/L');
+  // Portfolio setup
+  if(document.getElementById('port-setup-text')) document.getElementById('port-setup-text').innerHTML = currentLang==='en'?'Initial capital not set yet.<br>Enter your starting balance below.':'ยังไม่ได้ตั้งทุนเริ่มต้น<br>ใส่ยอดพอร์ตตอนเริ่มเทรดได้เลยครับ';
+  setText('port-init-label', currentLang==='en'?'Initial Capital ($)':'ทุนเริ่มต้น ($)');
+  setText('sett-cap-label', currentLang==='en'?'Initial Capital ($)':'ทุนเริ่มต้น ($)');
+  // Portfolio modal
+  setText('port-modal-amount-label', currentLang==='en'?'Amount ($)':'จำนวนเงิน ($)');
+  setText('port-modal-note-label', currentLang==='en'?'Note (optional)':'หมายเหตุ (ไม่บังคับ)');
+  // Dashboard section headers
+  setText('sec-wr', L.overallWR);
+  setText('sec-equity', L.equityCurve);
+  setText('sec-session', L.wrBySession);
+  setText('sec-tech', L.wrByTech);
+  setText('sec-ms', L.wrByMS);
+  // KPI labels
+  setText('kpi-label-pnl', L.netPnl);
+  setText('kpi-label-best', L.bestTrade);
+  setText('kpi-label-rr', L.avgRR);
+  setText('kpi-label-pf', L.profitFactor);
+  // Portfolio
+  setText('ph-label-el', L.currentBalance);
+  setText('ph-profit-label', L.profit);
+  setText('ph-capital-label', L.capital);
+  setText('ph-withdrawn-label', L.withdrawn);
+  setText('sec-tx', L.txHistory);
+  // PIN
+  setText('pin-sub-text', L.pinSub);
+  // Monthly view tabs
+  setText('mv-tab-monthly', currentLang==='en'?'Monthly':'เดือน');
+  setText('mv-tab-weekly', currentLang==='en'?'Weekly':'สัปดาห์');
+  setText('mv-tab-daily', currentLang==='en'?'Daily':'วัน');
+  // Form section dividers
+  document.querySelectorAll('.fsec-label').forEach((el,i) => {
+    const keys = [L.context, L.result, L.review];
+    if(keys[i]) el.textContent = keys[i];
+  });
+  // Form add photo
+  const addPhotoEl = document.querySelector('#img-upload-wrap .img-upload-btn span:last-child');
+  if(addPhotoEl) addPhotoEl.textContent = L.addPhoto;
+  // WR stat labels
+  setText('ws-label-win', currentLang==='en'?'Win':'ชนะ');
+  setText('ws-label-loss', currentLang==='en'?'Loss':'แพ้');
+  setText('ws-label-rr', currentLang==='en'?'Avg RR':'RR เฉลี่ย');
+  setText('ws-label-pf', currentLang==='en'?'P.Factor':'P.Factor');
+  // Re-render current screen
+  const sc = document.querySelector('.nb.active')?.dataset?.screen;
+  if(sc==='dash') renderDash && renderDash();
+  if(sc==='log') renderLog && renderLog();
+  if(sc==='monthly') renderMonthly && renderMonthly();
+  if(sc==='portfolio') renderPortfolio && renderPortfolio();
+  updateDpTriggerLabel && updateDpTriggerLabel();
+  updateMonthlyBadge && updateMonthlyBadge();
+}
+
+function setText(id, text) {
+  const el = document.getElementById(id); if(el && text) el.textContent = text;
+}
+
+function t(key) { return LANG[currentLang][key] || LANG['th'][key] || key; }
+function t2(key) { return LANG[currentLang][key] || LANG['th'][key] || key; }
+
+function toggleLang() {
+  currentLang = currentLang === 'th' ? 'en' : 'th';
+  settingsState.lang = currentLang;
+  saveSettingsState();
+  applyLang();
+  showToast(currentLang === 'th' ? '🇹🇭 เปลี่ยนเป็นภาษาไทย' : '🇬🇧 Changed to English');
+}
+
+// ── INIT EXTRA ──
+// ซ่อน app ไว้ก่อน Auth จะ resolve แล้วแสดง login หรือ app ให้เอง
+document.querySelector('.app').style.display = 'none';
+document.getElementById('google-login-screen').style.display = 'none'; // auth listener จะ handle
+loadProfile();
+// Apply saved theme
+const savedTheme = settingsState.theme || 'dark';
+isDark = savedTheme === 'dark';
+applyTheme(isDark);
+if (settingsState.lang) { currentLang = settingsState.lang; }
+setTimeout(applyLang, 100);
+// Fix sync toggle state
+if (settingsState.syncEnabled === false) { syncEnabled = false; setTimeout(() => { const t = document.getElementById('sett-sync-toggle'); if(t){ t.style.background='var(--s3)'; t.querySelector('.sett-toggle-dot').style.left='3px'; } }, 100); }
+// Register security panel in panels list
+const _oldToggle = _toggleSettPanel;
+window._settPanels = ['sett-capital-panel','sett-loss-panel','sett-tf-panel','sett-tech-panel','sett-ms-panel','sett-profile-panel','sett-security-panel'];
+window._toggleSettPanel = function(id) {
+  window._settPanels.forEach(p => { if(p!==id){ const el=document.getElementById(p); if(el) el.style.display='none'; } });
+  const el = document.getElementById(id);
+  if(el) el.style.display = el.style.display==='none'?'block':'none';
+};
+// Override the old function
+
+</script>
+</body>
+</html>
